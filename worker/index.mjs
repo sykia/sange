@@ -245,7 +245,14 @@ export default {
         method: "POST", body: form, headers: {Accept: "application/json"}, redirect: "manual"
       });
       if (upstream.status >= 300 && upstream.status < 400) return json({error: "upstream_redirect"}, 502);
-      if (!upstream.ok) return json({error: "token_exchange"}, upstream.status >= 400 ? upstream.status : 502);
+      if (!upstream.ok) {
+        let error = "token_exchange";
+        if (grant === "refresh_token" && [400, 401].includes(upstream.status)) {
+          const result = await upstream.json().catch(() => null);
+          if (result?.error === "invalid_grant") error = "invalid_grant";
+        }
+        return json({error}, upstream.status >= 400 ? upstream.status : 502);
+      }
       const {access_token, refresh_token, expires_in} = await upstream.json();
       if (typeof access_token !== "string" || !access_token || typeof refresh_token !== "string" || !refresh_token)
         return json({error: "upstream_response"}, 502);

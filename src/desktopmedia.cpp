@@ -17,7 +17,7 @@ QVariantMap DesktopMedia::snapshot() const {
     id = hasTrack ? "/org/mpris/MediaPlayer2/track/" + QString::fromLatin1(QCryptographicHash::hash(id.toUtf8(), QCryptographicHash::Sha256).toHex())
                   : "/org/mpris/MediaPlayer2/TrackList/NoTrack";
     QUrl artwork;
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
     artwork = QUrl(m_artworkFile);
 #else
     QString cover = track.value("artwork_url").toString();
@@ -60,7 +60,7 @@ void DesktopMedia::setArtworkNetwork(QNetworkAccessManager *network) {
     updateArtwork();
 }
 void DesktopMedia::updateArtwork() {
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
     const auto track = m_controller->state().value("current").toMap();
     QString source = track.value("artwork_url").toString();
     if (source.isEmpty()) source = track.value("user").toMap().value("avatar_url").toString();
@@ -71,8 +71,11 @@ void DesktopMedia::updateArtwork() {
     if (source == m_artworkSource) return;
     m_artworkSource = source;
     if (m_artworkReply) m_artworkReply->abort();
-    m_artworkFile.clear();
-    emit updated();
+    if (!m_artworkFile.isEmpty()) {
+        QFile::remove(QUrl(m_artworkFile).toLocalFile());
+        m_artworkFile.clear();
+        emit updated();
+    }
     if (source.isEmpty() || !m_artworkDirectory.isValid()) return;
     url = QUrl(source.replace("-large.", "-t500x500."));
     QNetworkRequest request(url);

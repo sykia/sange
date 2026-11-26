@@ -224,17 +224,27 @@ ApplicationWindow {
     property string activeScrollKey: scrollKey
     property bool restoringScroll: false
     property bool profileTabResetPending: false
+    function restoreListScroll() {
+        if (!restoringScroll) return
+        if (!tracks || !tracks.visible) {
+            restoringScroll = false
+            return
+        }
+        const offset = scrollPositions[activeScrollKey] || 0
+        if (offset > 0 && app.api.busy && !tracks.count) return
+        tracks.forceLayout()
+        if ((page === 4 && profileTabResetPending) || offset <= 0)
+            tracks.positionViewAtBeginning()
+        else
+            tracks.contentY = tracks.originY + Math.min(offset,
+                Math.max(0, tracks.contentHeight + tracks.bottomMargin - tracks.height))
+        restoringScroll = false
+    }
     onScrollKeyChanged: {
         restoringScroll = true
+        if (tracks) tracks.cancelFlick()
         activeScrollKey = scrollKey
-        const saved = scrollPositions[activeScrollKey] || 0
-        Qt.callLater(function() {
-            if (app.page === 4 && app.profileTabResetPending)
-                tracks.positionViewAtBeginning()
-            else
-                tracks.contentY = saved
-            restoringScroll = false
-        })
+        Qt.callLater(restoreListScroll)
     }
     onPageChanged: { if (!navigatingBack) pageHistory.push({page: previousPage, guest: guest, profileTab: profileTab}); previousPage = page; refresh(); if (prefs.motion && !pageArrival.running) pageArrival.start() }
     ParallelAnimation {
@@ -762,6 +772,7 @@ ApplicationWindow {
         SelectionBar { id: selectionBar; objectName: "collectionSelectionBar"; Layout.fillWidth: true; Layout.leftMargin: 12; Layout.rightMargin: 12; host: app; mobile: true; selection: trackSelection; visible: sc.signedIn && app.page > 0 && app.page < 4 && !(app.page === 2 && app.searchKind === "users") }
         ListView {
             id: tracks
+            objectName: "catalogueList"
             move: Transition { NumberAnimation { properties: "x,y"; duration: app.motion; easing.type: Easing.OutCubic } }
             displaced: Transition { NumberAnimation { properties: "x,y"; duration: app.motion; easing.type: Easing.OutCubic } }
             bottomMargin: navigationFooter.height
@@ -780,9 +791,10 @@ ApplicationWindow {
             onContentHeightChanged: loadTimer.restart()
             onHeightChanged: loadTimer.restart()
             Timer { id: loadTimer; interval: 100; onTriggered: tracks.maybeLoad() }
+            onDraggingChanged: if (dragging) app.restoringScroll = false
             onCountChanged: if (app.page === 4 && app.profileTabResetPending) positionViewAtBeginning()
             onContentYChanged: {
-                if (!app.restoringScroll && app.activeScrollKey === app.scrollKey) app.scrollPositions[app.activeScrollKey] = contentY
+                if (!app.restoringScroll && app.activeScrollKey === app.scrollKey) app.scrollPositions[app.activeScrollKey] = Math.max(0, contentY - originY)
                 if (!loadTimer.running) loadTimer.start()
             }
             header: Column {
@@ -891,6 +903,7 @@ ApplicationWindow {
     Connections {
         target: sc
         function onCatalogChanged() {
+            if (app.restoringScroll && !app.api.busy) Qt.callLater(app.restoreListScroll)
             if (app.profileTabResetPending && app.page === 4 && !app.api.busy) {
                 Qt.callLater(function() {
                     if (app.profileTabResetPending && app.page === 4) {

@@ -207,7 +207,7 @@ void StreamCacheWorker::fetch(const QString &key, QPointer<QTcpSocket> socket, Q
     auto *reply = head ? m_network.head(request) : m_network.get(request);
     reply->setProperty("sourceRoot", m_resources.value(key).root);
     if (background) { m_background = reply; reply->setProperty("cacheKey", key); }
-    else if (socket) connect(socket, &QTcpSocket::disconnected, reply, &QNetworkReply::abort);
+
     // HLS demuxers may treat a truncated segment as EOF and never recover after
     // a seek. Keep small HLS objects atomic so a failed download can be retried
     // before any successful HTTP response reaches the player.
@@ -217,6 +217,16 @@ void StreamCacheWorker::fetch(const QString &key, QPointer<QTcpSocket> socket, Q
     struct Download { QByteArray body; qint64 received = 0; bool headers = false; bool manifest = false; bool atomic = false; bool tooLarge = false; QElapsedTimer clock; };
     auto state = std::make_shared<Download>();
     state->clock.start();
+    if (socket) connect(socket, &QTcpSocket::disconnected, reply, [reply, state, head] {
+        if (reply->isFinished()) return;
+        bool hasLength = false;
+        const auto length = reply->rawHeader("Content-Length").toLongLong(&hasLength);
+        // A decoder may close immediately after reading the complete body, before Qt
+        // processes upstream completion. Allow that response to enter the cache.
+        if (!head && hasLength && length > 0 && !reply->hasRawHeader("Content-Encoding")
+            && state->received == length) return;
+        reply->abort();
+    });
     auto drain = [=] {
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (status < 200 || status >= 300) return;
@@ -230,7 +240,7 @@ void StreamCacheWorker::fetch(const QString &key, QPointer<QTcpSocket> socket, Q
                 if (reply->hasRawHeader(name)) headers += name + ": " + reply->rawHeader(name) + "\r\n";
             socket->write(headers + "\r\n");
         }
-        const QByteArray chunk = reply->readAll();
+        const QByteArray chunk = reply->isReadable() ? reply->readAll() : QByteArray{};
         state->received += chunk.size();
         if (!state->manifest && !state->atomic && socket && !head) socket->write(chunk);
         if (!state->tooLarge) {

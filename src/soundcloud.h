@@ -329,7 +329,7 @@ private:
     int m_playbackRetries = 0, m_playbackIdleSeconds = 0, m_connectionFailures = 0;
     qint64 m_recoveryPosition = 0, m_watchdogPosition = -1;
     QSet<QString> m_failedPlaybackTracks;
-    void prepareNext();
+    void prepareNext(bool reset = false);
     void cancelPreload();
     void updatePreloadPolicy();
     QList<QPair<QString, QUrl>> fullStreams(const QJsonObject &object) const;
@@ -451,6 +451,7 @@ private:
     QSet<QString> m_likedTracks, m_likePages;
     QHash<QString, bool> m_likeOverrides;
     bool m_likesComplete = false;
+    bool m_applyingSeek = false;
     qint64 m_pendingSeek = -1;
     int m_playlistGeneration = 0;
     QString m_playlistNext;

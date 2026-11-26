@@ -15,6 +15,14 @@ On first launch, old `GenericConfigLocation/SCrip/soundcloud.json` and `session.
 
 Refreshed OAuth tokens must be confirmed by storage before API requests continue. Save failures stop authorization with a message; the new session is not reported as saved. If the server has already rotated the refresh token but saving fails, signing in again may be necessary after restart. Transactions across the OAuth server and local storage cannot be atomic.
 
+A delayed API response for an older access token reuses the current token.
+An incomplete refresh response leaves the stored session intact. A successful
+refresh must contain a replacement for SoundCloud’s single-use refresh token.
+Only an explicit OAuth `invalid_grant` on HTTP 400 or 401 invalidates the local
+session. The Worker forwards this error code for refreshes while redacting
+upstream descriptions. Workers that still return the generic `token_exchange`
+error leave the local session intact.
+
 Logout removes the session from system storage and memory; deletion errors are not hidden. Local SoundCloud application parameters are retained separately from the session. Settings, library and plugin data are neither migrated nor deleted.
 
 Android Backup and device transfer exclude the old OAuth directory through `fullBackupContent` and `dataExtractionRules`; `noBackupFilesDir` is excluded by the system. Other settings and plugin data retain their previous backup rules. The app cannot delete existing external backups. Windows backups retain only the DPAPI blob; protection of the complete profile and Windows/Linux system stores depends on OS and backup policies. Protection does not cover malicious processes running as the user or root.

@@ -29,8 +29,11 @@ private slots:
         decoder.flush();
         QTRY_VERIFY(pending && pending->bytesAvailable() > 0);
         pending->readAll();
-        pending->write("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\naudio");
+        const QByteArray upstreamResponse = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\naudio";
+        QCOMPARE(pending->write(upstreamResponse), upstreamResponse.size());
         pending->flush();
+        QCOMPARE(pending->bytesToWrite(), 0);
+        pending->disconnectFromHost();
         // No processEvents: model the GUI joining a decoder during deferred
         // destruction. The proxy must deliver the response independently.
         QByteArray response;
@@ -41,8 +44,11 @@ private slots:
             else break;
         }
         QVERIFY2(response.endsWith("audio"), response.constData());
+        // Wait for proxy completion without processing the GUI event loop. Reading
+        // the last byte alone does not guarantee that the worker has cached it.
+        if (decoder.state() != QAbstractSocket::UnconnectedState)
+            QVERIFY(decoder.waitForDisconnected(1000));
         // Completed objects also remain readable with the GUI event loop blocked.
-        decoder.abort();
         decoder.connectToHost(local.host(), local.port());
         QVERIFY(decoder.waitForConnected(1000));
         decoder.write("GET " + local.path().toUtf8() + " HTTP/1.1\r\nHost: localhost\r\n\r\n");

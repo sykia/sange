@@ -24,6 +24,7 @@
 #include <QPointer>
 #include <QRandomGenerator>
 #include <QSaveFile>
+#include <QScopedValueRollback>
 #include <QSettings>
 #include <QNetworkInformation>
 #include <QGuiApplication>
@@ -76,8 +77,10 @@ QJsonObject readProgress() {
 void writeProgress(const QVariantMap &position, const QString &mode) {
     auto data = readProgress();
     const auto record = QJsonObject::fromVariantMap(position);
+    const bool wave = mode == "library" || mode == "discovery";
+    if (data.value("current") == record && (!wave || data.value(mode) == record)) return;
     data["current"] = record;
-    if (mode == "library" || mode == "discovery") data[mode] = record;
+    if (wave) data[mode] = record;
     const auto path = progressPath();
     if (!QDir().mkpath(QFileInfo(path).absolutePath())) return;
     QSaveFile file(path);
@@ -367,7 +370,9 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
                 if (!m_state.value("playbackActive").toBool()) savePlaybackPosition();
             }
             const qint64 duration = media->duration();
-            if (m_state.value("crossfade").toBool() && !m_crossfadeStarted && duration > 6000 && duration - p <= 3000)
+            if (!m_applyingSeek && !m_restoringPlayback && m_pendingSeek < 0 && m_state.value("playbackActive").toBool()
+                && media->playbackState() == QMediaPlayer::PlayingState && m_state.value("crossfade").toBool()
+                && !m_crossfadeStarted && duration > 6000 && duration - p <= 3000)
                 beginCrossfade();
         });
         connect(media, &QMediaPlayer::seekableChanged, this, [this, media](bool) {
@@ -423,10 +428,9 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
                 set("position", player().position());
                 if (m_state.value("playbackActive").toBool()) player().play();
             }
-            if (status == QMediaPlayer::EndOfMedia && !m_playbackRecovering) {
+            if (status == QMediaPlayer::EndOfMedia && !m_playbackRecovering && m_state.value("playbackActive").toBool()) {
                 const qint64 expected = m_state.value("current").toMap().value("duration").toLongLong();
-                if (m_state.value("playbackActive").toBool() && expected > 0 &&
-                    media->position() + 5000 < expected) recoverPlayback();
+                if (expected > 0 && media->position() + 5000 < expected) recoverPlayback();
                 else advancePlayback(true);
             }
         });
@@ -665,13 +669,19 @@ void SoundCloud::token(const QUrlQuery &form, bool basic, TokenFlow flow, std::f
         QJsonParseError parseError;
         const auto document = QJsonDocument::fromJson(reply->readAll(), &parseError);
         const auto obj = document.object();
-        if (reply->error() != QNetworkReply::NoError || parseError.error != QJsonParseError::NoError
-            || !document.isObject() || obj.value("access_token").toString().isEmpty()) {
-            const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString access = obj.value("access_token").toString();
+        const QString refresh = obj.value("refresh_token").toString();
+        if (reply->error() != QNetworkReply::NoError || code < 200 || code >= 300
+            || parseError.error != QJsonParseError::NoError || !document.isObject() || access.isEmpty()
+            || (flow != TokenFlow::ClientCredentials && refresh.isEmpty())) {
             QString message = countryDenied ? countryBlockMessage : code == 0 ? "Плохое соединение с интернетом. Проверьте сеть и повторите подключение." : code == 429 ? "Лимит входов SoundCloud. Подождите перед повторной попыткой."
                 : QString("SoundCloud не выдал токен (HTTP %1). Проверьте ключи, адрес возврата и доступ к сети.").arg(code);
+            if (code >= 200 && code < 300) message = "SoundCloud вернул неполный ответ авторизации. Повторите подключение.";
             m_refreshing = false;
-            if (flow == TokenFlow::Refresh && (code == 400 || code == 401)) {
+            if (flow == TokenFlow::Refresh && (code == 400 || code == 401)
+                && obj.value("error").toString() == "invalid_grant") {
+                message = "Сессия истекла. Войдите в SoundCloud снова.";
                 m_access.clear(); m_refresh.clear();
                 m_expires = 0; m_userSession = false;
                 if (!m_authStorage.remove("session", m_sessionPath)) {
@@ -691,8 +701,6 @@ void SoundCloud::token(const QUrlQuery &form, bool basic, TokenFlow flow, std::f
             if (failed) failed(message); else fail(message);
             return;
         }
-        const QString access = obj.value("access_token").toString();
-        const QString refresh = obj.value("refresh_token").toString();
         const qint64 expires = QDateTime::currentSecsSinceEpoch() + obj.value("expires_in").toInt(3600);
         const bool userSession = flow == TokenFlow::AuthorizationCode ? true
             : flow == TokenFlow::ClientCredentials ? false : m_userSession;
@@ -900,7 +908,12 @@ void SoundCloud::requestAttempt(const QString &path, Callback done, const QByteA
                 if (failed) failed(message); else fail(message);
                 return;
             }
-            if (status == 401 && retry && !m_refresh.isEmpty()) { m_expires = 0; requestAttempt(path, done, method, body, false, failed, started, redirects, attempt, background); return; }
+            if (status == 401 && retry && !m_refresh.isEmpty()) {
+                // A delayed response may belong to the token we have already rotated.
+                if (req.rawHeader("Authorization") == "OAuth " + m_access.toUtf8()) m_expires = 0;
+                requestAttempt(path, done, method, body, false, failed, started, redirects, attempt, background);
+                return;
+            }
             if (status == 302 && method == "GET" && (path.startsWith("/resolve?") || path.startsWith("https://api.soundcloud.com/resolve?")) && redirects == 0) {
                 const auto location = reply->url().resolved(reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl());
                 requestAttempt(location.toString(QUrl::FullyEncoded), done, method, {}, retry, failed, started, redirects + 1, attempt, background);
@@ -1111,9 +1124,9 @@ void SoundCloud::savePlayback() {
                                {"waveNext", m_waveNext}, {"waveSeeds", m_waveSeeds}, {"waveFamiliar", m_familiarTracks}, {"waveCandidates", m_waveCandidates},
                                {"waveRelatedNext", m_waveRelatedNext}, {"waveLoadSeeds", m_waveLoadSeeds},
                                {"waveSeedIndex", m_waveSeedIndex}, {"waveSeen", QStringList(m_waveSeen.values())}};
-    if (!m_waveMode.isEmpty())
-        settings.setValue("playback/waves/" + m_waveMode, QJsonDocument::fromVariant(snapshot).toJson(QJsonDocument::Compact));
-    settings.setValue("playback/session", QJsonDocument::fromVariant(snapshot).toJson(QJsonDocument::Compact));
+    const auto serialized = QJsonDocument::fromVariant(snapshot).toJson(QJsonDocument::Compact);
+    if (!m_waveMode.isEmpty()) settings.setValue("playback/waves/" + m_waveMode, serialized);
+    settings.setValue("playback/session", serialized);
     savePlaybackPosition();
 }
 void SoundCloud::savePlaybackPosition() {
@@ -1141,8 +1154,15 @@ void SoundCloud::restorePlayback(const QVariantMap &profile) {
     }
     const auto queue = snapshot.value("queue").toList();
     const int index = snapshot.value("index", -1).toInt();
-    if (index < 0 || index >= queue.size() || queue.size() > 10000) return;
-    for (const auto &track : queue) if (!urn(track.toMap()).startsWith("soundcloud:tracks:")) return;
+    if (index < 0 || index >= queue.size() || queue.size() > 10000
+        || std::any_of(queue.cbegin(), queue.cend(), [](const QVariant &track) {
+            return !urn(track.toMap()).startsWith("soundcloud:tracks:");
+        })) {
+        // The Android fallback has no account identifier to validate against a corrupt snapshot.
+        m_androidRestorePending = false; m_androidRestoreTrack.clear();
+        set("restoreCleared", true);
+        return;
+    }
     m_androidRestorePending = false; m_androidRestoreTrack.clear(); m_snapshotPlayback = true;
     m_queue = queue; m_queueIndex = index;
     restoreQueueOrder(snapshot.value("order").toMap());
@@ -2553,6 +2573,7 @@ void SoundCloud::seek(qint64 position) {
     if (m_state.value("current").toMap().isEmpty() && player().source().isEmpty()) return;
     const qint64 duration = this->duration();
     const qint64 target = duration > 0 ? qBound(qint64(0), position, duration) : qMax(qint64(0), position);
+    if (m_crossfadeStarted) finishCrossfade();
     m_pendingSeek = target;
     set("position", target);
     applyPendingSeek();
@@ -2566,7 +2587,10 @@ void SoundCloud::applyPendingSeek() {
     m_restorePosition = target;
     m_restoringPlayback = false;
     m_playerEffects.clear(); m_spareEffects.clear();
-    player().setPosition(target);
+    {
+        const QScopedValueRollback applyingSeek(m_applyingSeek, true);
+        player().setPosition(target);
+    }
     set("position", player().position());
     if (m_state.value("playbackActive").toBool()) player().play();
     savePlaybackPosition();
@@ -2640,7 +2664,7 @@ void SoundCloud::cancelPreload() {
 void SoundCloud::updatePreloadPolicy() {
     if (m_crossfadeStarted) finishCrossfade(false);
     m_streamCache.setBackgroundEnabled(preloadAllowed());
-    prepareNext();
+    prepareNext(true);
     if (preloadAllowed() && m_state.value("playing").toBool()) m_streamCache.warm(player().source());
 }
 void SoundCloud::setPlaybackQuality(int quality) {
@@ -2845,7 +2869,7 @@ void SoundCloud::nextStream(int generation, const char *reason) {
 }
 void SoundCloud::resolveStream(const QUrl &url, int generation, int redirects) {
     if (generation != m_playGeneration) return;
-    if (url.scheme() != "https" || redirects > 5 || !url.userInfo().isEmpty()) { startupStage("invalid_stream_address"); nextStream(generation, "invalid_address"); return; }
+    if (url.scheme() != "https" || url.host().isEmpty() || url.port(443) != 443 || redirects > 5 || !url.userInfo().isEmpty()) { startupStage("invalid_stream_address"); nextStream(generation, "invalid_address"); return; }
     // CDN SoundCloud выдаёт подписанные URL. OAuth передаём только API, никогда стороннему хосту.
     if (url.host() != "api.soundcloud.com") { startupStage("cdn_source"); m_startupSourceSet = true; player().setSource(m_streamCache.source(url)); if (m_state.value("playbackActive").toBool() && !m_restoringPlayback) player().play(); prepareNext(); return; }
     const auto wait = rateDeadline("streams") - m_requestNow();
@@ -3225,20 +3249,26 @@ void SoundCloud::holdPreloadedAudio(QMediaPlayer *media) {
 }
 
 // Готовим только один следующий поток. Ошибки фоновой загрузки не прерывают текущий трек.
-void SoundCloud::prepareNext() {
+void SoundCloud::prepareNext(bool reset) {
     if (m_crossfadeStarted) return;
     if (!m_waveMode.isEmpty() && m_queue.size() - m_queueIndex < 6 && m_state.value("waveError").toString().isEmpty()) refillWave();
-    cancelPreload();
-    const int generation = m_preloadGeneration;
-    if (!preloadAllowed()) return;
+    bool allowed = preloadAllowed();
 #ifdef Q_OS_ANDROID
-    if (!m_androidPreload) { if (m_startupPending) startupStage("preload_skipped"); return; }
+    allowed = allowed && m_androidPreload;
+    if (!allowed && m_startupPending) startupStage("preload_skipped");
 #endif
-    if ((m_startupPending && !m_startupSourceSet) || m_queueIndex < 0 || m_queue.isEmpty() || player().source().isEmpty()) return;
-    const int index = nextQueueIndex(true);
-    if (index < 0) return;
-    const auto track = m_queue[index].toMap();
-    if (track.value("access").toString() == "preview" || track.value("access").toString() == "blocked" || track.value("streamable") == false) return;
+    const bool ready = allowed && !(m_startupPending && !m_startupSourceSet)
+        && m_queueIndex >= 0 && !m_queue.isEmpty() && !player().source().isEmpty();
+    const int index = ready ? nextQueueIndex(true) : -1;
+    const auto track = index >= 0 ? m_queue[index].toMap() : QVariantMap{};
+    const bool playable = index >= 0 && track.value("access").toString() != "preview"
+        && track.value("access").toString() != "blocked" && track.value("streamable") != false;
+    if (!reset && playable && index == m_preloadIndex && urn(track) == m_preloadUrn
+        && ((m_preloadReply && !m_preloadReply->isFinished())
+            || (!m_preloadPlayer->source().isEmpty() && m_preloadPlayer->error() == QMediaPlayer::NoError))) return;
+    cancelPreload();
+    if (!playable) return;
+    const int generation = m_preloadGeneration;
     m_preloadIndex = index; m_preloadUrn = urn(track);
     if (m_startupPending) startupStage("preload_request");
     request(apiPath("tracks", m_preloadUrn) + "/streams", [this, generation](QJsonDocument doc) {
@@ -3289,7 +3319,7 @@ void SoundCloud::beginCrossfade() {
 }
 void SoundCloud::prepareStream(const QUrl &url, int generation, int redirects) {
     if (generation != m_preloadGeneration || !preloadAllowed()) return;
-    if (url.scheme() != "https" || redirects > 5 || !url.userInfo().isEmpty()) {
+    if (url.scheme() != "https" || url.host().isEmpty() || url.port(443) != 443 || redirects > 5 || !url.userInfo().isEmpty()) {
         if (!m_preloadCandidates.isEmpty()) prepareStream(m_preloadCandidates.takeFirst(), generation);
         return;
     }

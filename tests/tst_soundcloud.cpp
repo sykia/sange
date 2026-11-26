@@ -546,6 +546,12 @@ private slots:
         const auto current = sc.player().source();
         net.responses = {{200, "{\"hls_aac_160_url\":\"https://cdn.example/next.m3u8\"}", 200}};
         sc.prepareNext(); QVERIFY(sc.m_preloadReply);
+        const auto requestsBefore = net.requests.size();
+        const auto originalReply = sc.m_preloadReply;
+        sc.prepareNext();
+        sc.prepareNext();
+        QCOMPARE(net.requests.size(), requestsBefore);
+        QCOMPARE(sc.m_preloadReply, originalReply);
         const auto reply = sc.m_preloadReply;
         const auto generation = sc.m_preloadGeneration;
         sc.setPreloadEnabled(false);
@@ -591,7 +597,15 @@ private slots:
         sc.m_queueIndex = 0; sc.recordQueueEntry(); sc.set("current", a);
         sc.m_preloadUrn = "soundcloud:tracks:2"; sc.m_preloadIndex = 1; sc.m_preloadPlayer->setSource(source);
         QTRY_VERIFY(sc.m_preloadPlayer->isSeekable());
+        sc.setCrossfade(true);
+        sc.seek(8000);
+        QTRY_COMPARE(sc.player().position(), 8000);
+        QVERIFY(!sc.m_crossfadeStarted);
+        QCOMPARE(sc.m_queueIndex, 0);
         sc.beginCrossfade(); QVERIFY(sc.m_crossfadeStarted);
+        sc.seek(2500);
+        QVERIFY(!sc.m_crossfadeStarted);
+        QTRY_COMPARE(sc.player().position(), 2500);
         auto *incoming = sc.m_activePlayer;
         sc.setPreloadEnabled(false);
         QVERIFY(!sc.m_crossfadeStarted); QCOMPARE(sc.m_activePlayer, incoming); QCOMPARE(sc.player().source(), source);
@@ -635,7 +649,7 @@ private slots:
         media.command("stop"); QCOMPARE(media.snapshot().value("status").toString(), QString("Stopped"));
         QVERIFY(media.snapshot().value("title").toString().isEmpty());
     }
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
     void desktopArtworkLocalFile() {
         Network net, images; SoundCloud sc(nullptr, &net, secrets); sc.set("configured", false);
         DesktopMedia media(&sc, nullptr);
@@ -655,6 +669,7 @@ private slots:
         QCOMPARE(QImage(local.toLocalFile()).pixelColor(0, 0), QColor(Qt::red));
         QCOMPARE(images.requests.first().url().path(), QString("/first-t500x500.jpg"));
         select("https://i1.sndcdn.com/broken.jpg");
+        QVERIFY(!QFile::exists(local.toLocalFile()));
         QTest::qWait(30);
         QVERIFY(media.snapshot().value("artwork").toString().isEmpty());
         select("https://i1.sndcdn.com/slow.jpg");
@@ -664,6 +679,8 @@ private slots:
         QCOMPARE(images.requests.size(), 3);
         QCOMPARE(media.snapshot().value("title").toString(), QString("Cover"));
     }
+#endif
+#ifdef Q_OS_LINUX
     void mprisSessionBusProtocol() {
         if (!QDBusConnection::sessionBus().isConnected()) QSKIP("Session bus unavailable");
         Network net; SoundCloud sc(nullptr, &net, secrets); sc.set("configured", false);
@@ -1605,6 +1622,25 @@ private slots:
         QCOMPARE(data.value("current").toObject().value("position").toInt(), 12750);
         QCOMPARE(data.value("library").toObject().value("track").toString(), track.value("urn").toString());
         settings.remove("playback/waves/library");
+    }
+    void unchangedCheckpointIsNotRewritten() {
+        Network net; SoundCloud sc(nullptr, &net, secrets);
+        sc.m_restoreChecked = true;
+        sc.set("signedIn", true);
+        sc.set("profile", QVariantMap{{"urn", "soundcloud:users:checkpoint"}});
+        sc.set("current", QVariantMap{{"urn", "soundcloud:tracks:checkpoint"}});
+        sc.set("position", 12750);
+        sc.savePlaybackPosition();
+        QFile checkpoint(QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)).filePath("playback-progress.json"));
+        QVERIFY(checkpoint.open(QIODevice::ReadWrite));
+        QVERIFY(checkpoint.setFileTime(QDateTime::fromSecsSinceEpoch(946684800), QFileDevice::FileModificationTime));
+        checkpoint.close();
+        const auto writtenAt = QFileInfo(checkpoint).lastModified();
+        for (int i = 0; i < 10; ++i) sc.savePlaybackPosition();
+        QCOMPARE(QFileInfo(checkpoint).lastModified(), writtenAt);
+        sc.set("position", 13000);
+        sc.savePlaybackPosition();
+        QVERIFY(QFileInfo(checkpoint).lastModified() > writtenAt);
     }
     void seekDuringLoadingOverridesRestoredPosition() {
         Network net; SoundCloud sc(nullptr, &net, secrets);
@@ -2647,6 +2683,41 @@ private slots:
         int exchanges = 0; for (const auto &r : net.requests) if (r.url().host() == "secure.soundcloud.com") ++exchanges;
         QCOMPARE(exchanges, 1); QVERIFY(net.bodies[0].contains("grant_type=refresh_token"));
     }
+    void lateUnauthorizedReplyUsesRotatedToken() {
+        QVERIFY(AuthStorage(secrets).save("session", {{"client_id", "test-client"}, {"access_token", "old-access"},
+            {"refresh_token", "old-refresh"}, {"expires_at", QDateTime::currentSecsSinceEpoch() + 3600},
+            {"user_session", false}}));
+        Network net; SoundCloud sc(nullptr, &net, secrets); sc.set("configured", false);
+        QCoreApplication::processEvents();
+        sc.set("configured", true);
+        net.responses = {{401, "{}"}, {401, "{}", 150}, guest(), {200, "{}"}, {200, "{}"}};
+        int completed = 0;
+        sc.request("/early", [&completed](QJsonDocument) { ++completed; });
+        sc.request("/late", [&completed](QJsonDocument) { ++completed; });
+        QTRY_COMPARE(completed, 2);
+        QCOMPARE(net.requests.size(), 5);
+        QCOMPARE(net.requests[2].url().path(), QString("/oauth/token"));
+        QCOMPARE(net.requests[3].rawHeader("Authorization"), QByteArray("OAuth test-access"));
+        QCOMPARE(net.requests[4].rawHeader("Authorization"), QByteArray("OAuth test-access"));
+        Network restartNet; SoundCloud restarted(nullptr, &restartNet, secrets);
+        QCOMPARE(restarted.m_refresh, QString("test-refresh"));
+    }
+    void incompleteRefreshLeavesStoredSessionIntact() {
+        QVERIFY(AuthStorage(secrets).save("session", {{"client_id", "test-client"}, {"access_token", "old-access"},
+            {"refresh_token", "old-refresh"}, {"expires_at", 0}, {"user_session", true}}));
+        Network net; SoundCloud sc(nullptr, &net, secrets); sc.set("configured", false);
+        QCoreApplication::processEvents();
+        sc.set("configured", true);
+        net.responses = {{200, R"({"access_token":"new-access","expires_in":3600})"}};
+        bool completed = false, failed = false;
+        sc.ensureToken([&completed] { completed = true; }, [&failed](QString) { failed = true; });
+        QTRY_VERIFY(failed);
+        QVERIFY(!completed);
+        Network restartNet; SoundCloud restarted(nullptr, &restartNet, secrets);
+        QCOMPARE(restarted.m_access, QString("old-access"));
+        QCOMPARE(restarted.m_refresh, QString("old-refresh"));
+        QVERIFY(restarted.m_userSession);
+    }
     void failedRefreshFailsEveryWaitingOperation() {
         QFile session(config + "/session.json"); QVERIFY(session.open(QIODevice::WriteOnly));
         session.write("{\"client_id\":\"test-client\",\"access_token\":\"old\",\"refresh_token\":\"refresh-fails\",\"expires_at\":0,\"user_session\":true}"); session.close();
@@ -2675,7 +2746,8 @@ private slots:
         QVERIFY(net.requests.first().url().path().endsWith("/oauth/token"));
     }
     void failedRefreshCompletesWaitersForOAuthFailures() {
-        QList<Response> failures{{400, "{}"}, {401, "{}"}, {429, "{}"}, {500, "{}"},
+        QList<Response> failures{{400, R"({"error":"invalid_grant"})"}, {401, R"({"error":"invalid_grant"})"},
+            {400, "{}"}, {401, R"({"error":"invalid_client"})"}, {429, "{}"}, {500, "{}"},
             {0, "{}", 0, QNetworkReply::TimeoutError}, {200, "not-json"}};
         for (const auto &failure : failures) {
             secrets->records.clear(); prepare();
@@ -2689,7 +2761,7 @@ private slots:
             });
             QTRY_COMPARE(errors, 1);
             QCOMPARE(net.requests.size(), 1);
-            if (failure.status == 400 || failure.status == 401) {
+            if (failure.body.contains("invalid_grant")) {
                 QVERIFY(sc.m_access.isEmpty()); QVERIFY(sc.m_refresh.isEmpty()); QVERIFY(!sc.m_userSession);
                 QVERIFY(!secrets->records.contains("session"));
             } else {
@@ -2706,7 +2778,7 @@ private slots:
             {"refresh_token", "refresh-invalid"}, {"expires_at", 0}, {"user_session", true}};
         QVERIFY(storage.save("session", oldSession));
         secrets->removable = false;
-        Network net; net.responses = {{401, "{}"}};
+        Network net; net.responses = {{401, R"({"error":"invalid_grant"})"}};
         SoundCloud sc(nullptr, &net, secrets);
         int errors = 0;
         QString failureMessage;
@@ -2730,7 +2802,7 @@ private slots:
         AuthStorage storage(secrets);
         QVERIFY(storage.save("session", {{"client_id", "test-client"}, {"access_token", "old-access"},
             {"refresh_token", "refresh-invalid"}, {"expires_at", 0}, {"user_session", true}}));
-        Network net; net.responses = {{401, "{}"}};
+        Network net; net.responses = {{401, R"({"error":"invalid_grant"})"}};
         SoundCloud sc(nullptr, &net, secrets);
         secrets->removable = false; secrets->writable = false;
         int errors = 0;
@@ -2745,7 +2817,7 @@ private slots:
         QVERIFY(storage.save("session", {{"client_id", "test-client"}, {"access_token", "old-access"},
             {"refresh_token", "refresh-invalid"}, {"expires_at", QDateTime::currentSecsSinceEpoch() + 3600}, {"user_session", true}}));
         Response lateMe{200, "{\"username\":\"Stale account\"}"}; lateMe.delay = 100;
-        Network net; net.responses = {lateMe, {401, "{}"}};
+        Network net; net.responses = {lateMe, {401, R"({"error":"invalid_grant"})"}};
         SoundCloud sc(nullptr, &net, secrets);
         sc.profile();
         QTRY_COMPARE(net.requests.size(), 1);
@@ -3062,8 +3134,10 @@ private slots:
         net.responses = {{200, "{\"hls_aac_160_url\":\"https://api.soundcloud.com/stream/old\"}"},
                          {200, "{\"url\":\"https://cdn.example.test/old.m3u8\"}", 100},
                          {200, "{\"preview_mp3_128_url\":\"https://cdn.example.test/preview.mp3\"}"}};
+        sc.m_queue[1] = QVariantMap{{"urn", "soundcloud:tracks:3"}};
         sc.prepareNext();
         QTRY_COMPARE(net.responses.size(), 1);
+        sc.m_queue[1] = QVariantMap{{"urn", "soundcloud:tracks:4"}};
         sc.prepareNext();
         QTest::qWait(160);
         QVERIFY(sc.m_preloadPlayer->source().isEmpty());

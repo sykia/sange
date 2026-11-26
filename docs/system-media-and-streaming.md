@@ -7,17 +7,18 @@ Windows uses `ISystemMediaTransportControlsInterop::GetForWindow` for the Qt
 window, with native WinRT ABI interfaces from the platform SDK (no additional
 library). macOS uses MediaPlayer Now Playing and remote command handlers with
 callbacks queued to the Qt GUI thread. It publishes text metadata, duration,
-position and playback state; macOS artwork is not currently published.
+position, playback state and securely downloaded artwork.
 Android keeps its existing MediaBridge and playback service.
 
 The desktop adapters publish title, credited artist, duration, playback intent,
-position and command capabilities. Linux and Windows also publish public unsigned
-SoundCloud artwork. Linux downloads artwork through the same CDN transport as
-the application and publishes a local PNG file URL, so the desktop shell does
-not need direct CDN access. Files live in a temporary directory until exit;
-stale downloads cannot replace the current cover. Invalid images and failed
-downloads leave text metadata and playback controls available. It never
-exports the controller's complete state, OAuth credentials or stream URLs.
+position and command capabilities. Windows publishes the public SoundCloud
+artwork URL. Linux and macOS download public artwork through the application's
+CDN transport. Linux presents a temporary local PNG to the shell, and macOS
+presents an image through MediaPlayer. Temporary artwork is replaced when the
+cover changes. Stale downloads cannot replace the current cover. Invalid images
+and failed downloads leave text metadata and playback controls available.
+The adapters never export the controller's complete state, OAuth credentials
+or stream URLs.
 MPRIS positions and Seeked use microseconds; SMTC timeline values use 100 ns;
 the controller uses milliseconds. Position updates do not produce MPRIS
 PropertiesChanged. SetPosition rejects stale track identities. Next/Previous

@@ -268,6 +268,14 @@ public final class PlaybackLifecycleTest extends Instrumentation {
             Method cancel = service.getDeclaredMethod("cancelFocusResume"); cancel.setAccessible(true); cancel.invoke(playbackService);
             focus.invoke(playbackService, android.media.AudioManager.AUDIOFOCUS_GAIN);
             require(!(Boolean) field(service, playbackService, "resumeAfterFocus"), "Ручная остановка не отменила resume");
+            active.setBoolean(null, true);
+            focus.invoke(playbackService, android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT);
+            require((Boolean) field(service, playbackService, "resumeAfterFocus"), "Нет resume перед отключением наушников");
+            android.content.BroadcastReceiver noisy =
+                    (android.content.BroadcastReceiver) field(service, playbackService, "noisy");
+            noisy.onReceive(activity, new Intent(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY));
+            require(!(Boolean) field(service, playbackService, "resumeAfterFocus"), "Отключение наушников оставило resume");
+            focus.invoke(playbackService, android.media.AudioManager.AUDIOFOCUS_GAIN);
             focus.invoke(playbackService, android.media.AudioManager.AUDIOFOCUS_LOSS);
             require(!(Boolean) field(service, playbackService, "resumeAfterFocus"), "Постоянная потеря оставила resume");
             snapshot(false, false, false, true);

@@ -27,7 +27,12 @@ public class PlaybackService extends Service {
     private long seekPosition;
     private final Runnable seekAction = () -> MediaBridge.dispatch(PlaybackService.this, 3, seekPosition);
     private final BroadcastReceiver noisy = new BroadcastReceiver() {
-        @Override public void onReceive(Context context, Intent intent) { MediaBridge.dispatch(context, 5, 0); }
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction()) || destroyed) return;
+            cancelFocusResume();
+            if (MediaBridge.ready) MediaBridge.dispatch(context, 5, 0);
+            else MediaBridge.recordDeferredAction(5);
+        }
     };
     @Override public void onCreate() {
         super.onCreate(); instance = this;
@@ -36,6 +41,7 @@ public class PlaybackService extends Service {
         audioManager = getSystemService(AudioManager.class);
         focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setWillPauseWhenDucked(true)
             .setOnAudioFocusChangeListener(this::handleAudioFocusChange, MediaBridge.MAIN).build();
         IntentFilter filter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(noisy, filter, Context.RECEIVER_NOT_EXPORTED);

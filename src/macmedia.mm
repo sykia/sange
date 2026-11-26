@@ -2,15 +2,37 @@
 #include "soundcloud.h"
 #include <QPointer>
 #include <QCoreApplication>
+#include <QUrl>
 #include <cmath>
 #include <limits>
-#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <MediaPlayer/MediaPlayer.h>
 
 struct DesktopMedia::Platform {
     NSMutableArray *commands = [[NSMutableArray alloc] init];
     NSMutableArray *tokens = [[NSMutableArray alloc] init];
+    QString artworkPath;
+    MPMediaItemArtwork *artwork = nil;
+    qint64 positionSecond = -1;
+    qint64 duration = -1;
+
+    void updateArtwork(const QString &path) {
+        if (artworkPath == path) return;
+        artworkPath = path;
+        [artwork release];
+        artwork = nil;
+        if (path.isEmpty()) return;
+        const auto file = QUrl(path).toLocalFile().toUtf8();
+        NSImage *cover = [[NSImage alloc] initWithContentsOfFile:[NSString stringWithUTF8String:file.constData()]];
+        if (cover) {
+            artwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:cover.size requestHandler:^NSImage *(CGSize) {
+                return cover;
+            }];
+            [cover release];
+        }
+    }
     ~Platform() {
+        [artwork release];
         for (NSUInteger i = 0; i < commands.count; ++i)
             [(MPRemoteCommand *)commands[i] removeTarget:tokens[i]];
         [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nil;
@@ -23,11 +45,20 @@ DesktopMedia::DesktopMedia(SoundCloud *controller, QWindow *window, QObject *par
     : QObject(parent), m_controller(controller), m_window(window) {
     initializePlatform();
     connect(controller, &SoundCloud::catalogChanged, this, &DesktopMedia::updated);
-    connect(controller, &SoundCloud::progressChanged, this, &DesktopMedia::updated);
-    connect(controller, &SoundCloud::playbackSeeked, this, [this] { emit seeked(m_controller->position() * 1000); });
+    connect(controller, &SoundCloud::progressChanged, this, [this] {
+        if (m_controller->position() / 1000 != m_platform->positionSecond
+            || m_controller->duration() != m_platform->duration) emit updated();
+    });
+    connect(controller, &SoundCloud::playbackSeeked, this, [this] {
+        emit seeked(m_controller->position() * 1000);
+        emit updated();
+    });
     auto refresh = [this] {
         @autoreleasepool {
             const auto s = snapshot();
+            m_platform->positionSecond = m_controller->position() / 1000;
+            m_platform->duration = m_controller->duration();
+            m_platform->updateArtwork(s.value("artwork").toString());
             auto *center = [MPNowPlayingInfoCenter defaultCenter];
             if (!s.value("hasTrack").toBool()) {
                 center.nowPlayingInfo = nil;
@@ -36,13 +67,15 @@ DesktopMedia::DesktopMedia(SoundCloud *controller, QWindow *window, QObject *par
                 const auto title = s.value("title").toString().toUtf8();
                 const auto artist = s.value("artist").toString().toUtf8();
                 const bool playing = s.value("status").toString() == "Playing";
-                center.nowPlayingInfo = @{
+                NSMutableDictionary *info = [NSMutableDictionary dictionaryWithDictionary:@{
                     MPMediaItemPropertyTitle: [NSString stringWithUTF8String:title.constData()],
                     MPMediaItemPropertyArtist: [NSString stringWithUTF8String:artist.constData()],
                     MPMediaItemPropertyPlaybackDuration: @(s.value("duration").toLongLong() / 1000.0),
                     MPNowPlayingInfoPropertyElapsedPlaybackTime: @(s.value("position").toLongLong() / 1000.0),
                     MPNowPlayingInfoPropertyPlaybackRate: @(playing ? 1.0 : 0.0)
-                };
+                }];
+                if (m_platform->artwork) info[MPMediaItemPropertyArtwork] = m_platform->artwork;
+                center.nowPlayingInfo = info;
                 center.playbackState = playing ? MPNowPlayingPlaybackStatePlaying : MPNowPlayingPlaybackStatePaused;
             }
             auto *remote = [MPRemoteCommandCenter sharedCommandCenter];

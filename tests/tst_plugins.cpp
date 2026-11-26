@@ -25,6 +25,7 @@ class AndroidLayoutModel : public QObject {
     Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
     Q_PROPERTY(QVariantMap catalogState READ state NOTIFY catalogChanged)
     Q_PROPERTY(QVariantMap uiState READ state NOTIFY catalogChanged)
+    Q_PROPERTY(QVariantList trackModel MEMBER catalogue NOTIFY catalogChanged)
     Q_PROPERTY(QVariantList homeShelves READ home NOTIFY catalogChanged)
     Q_PROPERTY(QVariantList playlistRows READ playlistTracks NOTIFY catalogChanged)
     Q_PROPERTY(QVariantList queueTracks READ queue NOTIFY catalogChanged)
@@ -56,9 +57,11 @@ public:
     Q_INVOKABLE void seek(qint64 timestamp) { playbackPosition = timestamp; emit positionChanged(); }
     Q_INVOKABLE void resumePlayback() {}
     Q_INVOKABLE void copyText(const QString &) {}
+    QVariantList catalogue;
+    bool catalogueBusy = false;
     QVariantMap profileSnapshot;
     QVariantMap state() const {
-        return {{"preloadEnabled", true}, {"wifiPolicyAvailable", true}, {"repeatMode", repeatMode}, {"home", QVariantList{QVariantMap{{"title", "Микс любимых"}, {"subtitle", "Похоже на «Длинное название исходного трека» · SoundCloud"},
+        return {{"busy", catalogueBusy}, {"preloadEnabled", true}, {"wifiPolicyAvailable", true}, {"repeatMode", repeatMode}, {"home", QVariantList{QVariantMap{{"title", "Микс любимых"}, {"subtitle", "Похоже на «Длинное название исходного трека» · SoundCloud"},
             {"tracks", QVariantList{QVariantMap{{"title", "Проверка отступов"}, {"urn", "soundcloud:tracks:seed"}, {"user", QVariantMap{{"urn", "soundcloud:users:artist"}, {"username", "Исполнитель"}}}}}}}}},
             {"playlistTracks", QVariantList{QVariantMap{{"urn", "soundcloud:tracks:1"}, {"title", "Первый трек"}, {"user", QVariantMap{{"username", "Исполнитель"}}}}, QVariantMap{{"urn", "soundcloud:tracks:2"}, {"title", "Второй трек"}}}},
             {"profile", profileSnapshot}, {"current", currentSnapshot}};
@@ -972,6 +975,35 @@ Item {
         object->setProperty("page", 1);
         QTest::qWait(40);
         QVERIFY(collectionTools->isVisible()); QVERIFY(selectionBar->isVisible());
+        auto *catalogue = object->findChild<QQuickItem *>("catalogueList");
+        QVERIFY(catalogue);
+        QVariantList rows;
+        for (int row = 0; row < 30; ++row)
+            rows.append(QVariantMap{{"title", QString::number(row)}, {"urn", QString("soundcloud:tracks:%1").arg(row)}});
+        sc.catalogue = rows;
+        emit sc.catalogChanged();
+        QTRY_COMPARE(catalogue->property("count").toInt(), 30);
+        const auto scrollOffset = [&] {
+            return catalogue->property("contentY").toReal() - catalogue->property("originY").toReal();
+        };
+        catalogue->setProperty("contentY", catalogue->property("originY").toReal() + 520);
+        QCOMPARE(scrollOffset(), 520);
+        object->setProperty("page", 3);
+        QTRY_COMPARE(scrollOffset(), 0);
+        sc.catalogueBusy = true;
+        sc.catalogue.clear();
+        emit sc.catalogChanged();
+        object->setProperty("page", 1);
+        QTRY_VERIFY(object->property("restoringScroll").toBool());
+        QTest::qWait(50);
+        QVERIFY(object->property("restoringScroll").toBool());
+        sc.catalogueBusy = false;
+        sc.catalogue = rows;
+        emit sc.catalogChanged();
+        QTRY_COMPARE(scrollOffset(), 520);
+        QTRY_VERIFY(!object->property("restoringScroll").toBool());
+        sc.catalogue.clear();
+        emit sc.catalogChanged();
         object->setProperty("page", 5);
         QTest::qWait(80);
         for (const auto size : {QSize(320,640), QSize(412,860)}) {

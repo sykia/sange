@@ -39,6 +39,15 @@ test("accepts a valid refresh token form without Content-Length", async () => {
   assert.equal(res.status, 200);
 });
 
+test("forwards only the refresh revocation code from upstream OAuth errors", async () => {
+  for (const error of ["invalid_grant", "invalid_client"]) {
+    const res = await response(request("grant_type=refresh_token&refresh_token=opaque"),
+      async () => new Response(JSON.stringify({error, error_description: "private upstream detail"}), {status: 400}));
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {error: error === "invalid_grant" ? error : "token_exchange"});
+  }
+});
+
 test("rejects bodies over 8192 bytes even when Content-Length is absent", async () => {
   const res = await response(request("x".repeat(8193)));
   assert.equal(res.status, 413);

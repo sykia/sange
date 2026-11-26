@@ -270,7 +270,7 @@ int main(int argc, char *argv[])
 #ifndef Q_OS_ANDROID
     auto *window = qobject_cast<QWindow *>(engine.rootObjects().first());
     DesktopMedia desktopMedia(&soundcloud, window);
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
     desktopMedia.setArtworkNetwork(artwork.create(&desktopMedia));
 #endif
     QIcon icon(":/qt/qml/SCrip/assets/blob.png");
