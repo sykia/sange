@@ -74,7 +74,7 @@ static QString updateFixtureName(const QString &version) {
 
 // Транспорт подменяется только в тестах. Рабочий клиент использует фиксированные HTTPS-хосты.
 #ifndef Q_MOC_RUN
-struct Response { int status = 200; QByteArray body; int delay = 0; QNetworkReply::NetworkError error = QNetworkReply::NoError; int chunkSize = 0; qint64 contentLength = -2; bool lateSignals = false; bool redirectBeforeBody = false; QUrl redirect; QList<QPair<QByteArray, QByteArray>> headers; };
+struct Response { int status = 200; QByteArray body; int delay = 0; QNetworkReply::NetworkError error = QNetworkReply::NoError; int chunkSize = 0; qint64 contentLength = -2; bool lateSignals = false; bool redirectBeforeBody = false; QUrl redirect; QList<QPair<QByteArray, QByteArray>> headers; bool held = false; };
 class Reply : public QNetworkReply {
 public:
     Reply(const QNetworkRequest &request, Response response, QObject *parent) : QNetworkReply(parent), bytes(response.body), chunkSize(response.chunkSize > 0 ? response.chunkSize : qMax(1, response.body.size())) {
@@ -87,6 +87,7 @@ public:
         setRawHeader("Content-Length", QByteArray::number(contentLength));
         open(QIODevice::ReadOnly | QIODevice::Unbuffered);
         auto *timer = new QTimer(this); timer->setInterval(1);
+        deliveryTimer = timer;
         connect(timer, &QTimer::timeout, this, [this, response, timer] {
             if (aborted) { timer->stop(); timer->deleteLater(); return; }
             if (!metadataEmitted) {
@@ -107,8 +108,9 @@ public:
             emit readyRead();
             if (released >= bytes.size()) { timer->stop(); timer->deleteLater(); setFinished(true); emit finished(); if (response.lateSignals) { emit readyRead(); emit finished(); } }
         });
-        QTimer::singleShot(response.delay, timer, [timer] { timer->start(); });
+        if (!response.held) QTimer::singleShot(response.delay, timer, [timer] { timer->start(); });
     }
+    void release() { if (deliveryTimer && !isFinished()) deliveryTimer->start(); }
     void abort() override { if (isFinished()) return; aborted = true; setError(QNetworkReply::OperationCanceledError, "Cancelled"); setFinished(true); emit finished(); }
     qint64 bytesAvailable() const override { return released - offset + QNetworkReply::bytesAvailable(); }
 protected:
@@ -118,6 +120,7 @@ protected:
         memcpy(data, bytes.constData() + offset, size_t(count)); offset += count; return count;
     }
 private:
+    QPointer<QTimer> deliveryTimer;
     QByteArray bytes; qint64 offset = 0, released = 0; int chunkSize = 1; bool aborted = false, metadataEmitted = false;
 };
 class Network : public QNetworkAccessManager {
@@ -2647,13 +2650,20 @@ private slots:
     }
     void independentRequestErrorsDoNotChangePlayerBuffering() {
         for (const auto &response : {Response{500, "{}"}, Response{200, "{invalid"}}) {
-            Network net; net.responses = {{200, "{\"collection\":[{\"urn\":\"soundcloud:tracks:1\"}]}", 100}, response};
+            Response listing{200, R"({"collection":[{"urn":"soundcloud:tracks:1"}]})"};
+            listing.held = true;
+            Network net; net.responses = {listing, response};
             SoundCloud sc(nullptr, &net, secrets);
             sc.set("configured", false); sc.m_access = "test-access"; sc.m_expires = QDateTime::currentSecsSinceEpoch() + 3600;
-            sc.set("buffering", true); sc.browse("tracks", "loading"); sc.profile();
+            sc.set("buffering", true); sc.browse("tracks", "loading");
+            const auto pending = net.findChildren<QNetworkReply *>();
+            QCOMPARE(pending.size(), 1);
+            auto *listingReply = static_cast<Reply *>(pending.first());
+            sc.profile();
             QTRY_VERIFY(!sc.state()["error"].toString().isEmpty());
             QVERIFY(sc.state()["busy"].toBool());
             QVERIFY(sc.state()["buffering"].toBool());
+            listingReply->release();
             QTRY_VERIFY(!sc.state()["busy"].toBool());
             QCOMPARE(sc.state()["tracks"].toList().size(), 1);
             QVERIFY(sc.state()["buffering"].toBool());
