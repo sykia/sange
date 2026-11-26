@@ -3118,12 +3118,23 @@ private slots:
         SoundCloud sc(nullptr, &net, secrets); QTRY_VERIFY(sc.state()["connected"].toBool());
         net.requests.clear();
         sc.m_access = "test-access"; sc.m_expires = QDateTime::currentSecsSinceEpoch() + 3600;
-        sc.player().setSource(QUrl("https://cdn.example.test/current.m3u8"));
+        QFile wav(directory.filePath("preload-current.wav"));
+        QVERIFY(wav.open(QIODevice::WriteOnly));
+        QDataStream header(&wav);
+        header.setByteOrder(QDataStream::LittleEndian);
+        constexpr int bytes = 44100 * 2;
+        header.writeRawData("RIFF", 4); header << quint32(bytes + 36); header.writeRawData("WAVEfmt ", 8);
+        header << quint32(16) << quint16(1) << quint16(1) << quint32(44100) << quint32(88200) << quint16(2) << quint16(16);
+        header.writeRawData("data", 4); header << quint32(bytes); wav.write(QByteArray(bytes, '\0')); wav.close();
+        sc.player().setSource(QUrl::fromLocalFile(wav.fileName()));
+        QTRY_VERIFY(sc.player().isSeekable());
         sc.set("queue", QVariantList{QVariantMap{{"urn", "soundcloud:tracks:1"}}, QVariantMap{{"urn", "soundcloud:tracks:2"}}});
         sc.m_queueIndex = 0;
         net.responses = {{200, "{\"preview_mp3_128_url\":\"https://cdn.example.test/preview.mp3\"}"}};
         sc.prepareNext();
-        QTest::qWait(60);
+        QVERIFY(sc.m_preloadReply);
+        QSignalSpy previewFinished(sc.m_preloadReply, &QNetworkReply::finished);
+        QTRY_COMPARE(previewFinished.size(), 1);
         QVERIFY(sc.m_preloadPlayer->source().isEmpty());
         sc.beginCrossfade(); QVERIFY(!sc.m_crossfadeStarted);
         net.responses = {{200, "{\"hls_aac_160_url\":\"http://invalid/160\",\"hls_aac_96_url\":\"https://api.soundcloud.com/stream/96\",\"hls_mp3_128_url\":\"https://cdn.example.test/full.m3u8\"}"}, {403, "{}"}};
@@ -3131,15 +3142,22 @@ private slots:
         QTRY_VERIFY(!sc.m_preloadPlayer->source().isEmpty());
         QVERIFY(!sc.m_preloadPlayer->source().toString().contains("preview"));
         QVERIFY(sc.m_preloadCandidates.isEmpty());
+        QCOMPARE(net.requests.size(), 3);
+        QCOMPARE(net.requests.last().url().path(), QString("/stream/96"));
         net.responses = {{200, "{\"hls_aac_160_url\":\"https://api.soundcloud.com/stream/old\"}"},
-                         {200, "{\"url\":\"https://cdn.example.test/old.m3u8\"}", 100},
+                         {200, "{\"url\":\"https://cdn.example.test/old.m3u8\"}", 60000},
                          {200, "{\"preview_mp3_128_url\":\"https://cdn.example.test/preview.mp3\"}"}};
         sc.m_queue[1] = QVariantMap{{"urn", "soundcloud:tracks:3"}};
         sc.prepareNext();
         QTRY_COMPARE(net.responses.size(), 1);
+        QVERIFY(sc.m_preloadReply);
+        QSignalSpy canceled(sc.m_preloadReply, &QNetworkReply::finished);
         sc.m_queue[1] = QVariantMap{{"urn", "soundcloud:tracks:4"}};
         sc.prepareNext();
-        QTest::qWait(160);
+        QCOMPARE(canceled.size(), 1);
+        QVERIFY(sc.m_preloadReply);
+        QSignalSpy replacementFinished(sc.m_preloadReply, &QNetworkReply::finished);
+        QTRY_COMPARE(replacementFinished.size(), 1);
         QVERIFY(sc.m_preloadPlayer->source().isEmpty());
     }
     void trackLikesSerializeFailuresAndIgnoreOldAccounts() {
