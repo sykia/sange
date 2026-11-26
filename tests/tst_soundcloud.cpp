@@ -5384,11 +5384,12 @@ private slots:
             sc.browse("tracks", QString("virtual-%1").arg(size));
             QTRY_COMPARE(sc.state()["tracks"].toList().size(), size);
             QTRY_VERIFY(!sc.state()["busy"].toBool());
+            // Backend rows arrive before Qt Quick applies its deferred model update.
+            QTRY_COMPARE(trackView->property("count").toInt(), size);
             QTRY_VERIFY(trackView->property("activeDelegateCount").toInt() <= 40);
-            if (size == 0) QCOMPARE(trackView->property("activeDelegateCount").toInt(), 0);
-            if (size == 1) QCOMPARE(trackView->property("height").toReal(), 58.0);
+            if (size == 0) QTRY_COMPARE(trackView->property("activeDelegateCount").toInt(), 0);
+            if (size == 1) QTRY_COMPARE(trackView->property("height").toReal(), 58.0);
             if (size == 5000) {
-                QCOMPARE(trackView->property("count").toInt(), 5000);
                 // Model notifications precede the view's deferred layout and scroll reset.
                 QCoreApplication::processEvents();
                 QVERIFY(QMetaObject::invokeMethod(trackView, "forceLayout"));
@@ -5430,11 +5431,11 @@ private slots:
             sc.browse("tracks", QString("grid-%1").arg(size));
             QTRY_COMPARE(sc.state()["tracks"].toList().size(), size);
             QTRY_VERIFY(!sc.state()["busy"].toBool());
+            QTRY_COMPARE(gridView->property("count").toInt(), size);
             QTRY_VERIFY(gridView->property("activeDelegateCount").toInt() <= 40);
-            if (size == 0) QCOMPARE(gridView->property("activeDelegateCount").toInt(), 0);
-            if (size == 1) QCOMPARE(gridView->property("height").toReal(), gridView->property("tileHeight").toReal());
+            if (size == 0) QTRY_COMPARE(gridView->property("activeDelegateCount").toInt(), 0);
+            if (size == 1) QTRY_COMPARE(gridView->property("height").toReal(), gridView->property("tileHeight").toReal());
             if (size == 5000) {
-                QCOMPARE(gridView->property("count").toInt(), 5000);
                 QVariant title;
                 QTRY_VERIFY(([&] {
                     return QMetaObject::invokeMethod(gridView, "trackTitleAt", Q_RETURN_ARG(QVariant, title), Q_ARG(QVariant, 0))
