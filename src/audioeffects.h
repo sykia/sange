@@ -17,6 +17,7 @@ public:
     static constexpr std::array<double, 5> frequencies{60, 250, 1000, 4000, 12000};
     void configure(int rate, int channels, const std::array<double, 5> &gains);
     void reset();
+    QVariantList response() const;
     void process(float *samples, int frames);
     static QVariantList spectrum(const float *samples, int frames, int channels, int rate);
 private:
@@ -34,7 +35,8 @@ class AudioEffects : public QObject {
 public:
     explicit AudioEffects(QObject *parent = nullptr);
     void setGains(const std::array<double, 5> &gains);
-    bool write(const QAudioBuffer &buffer, double volume);
+    bool write(const QAudioBuffer &buffer, double volume, const QAudioDevice &device);
+    void setVolume(double volume);
     void clear();
     QByteArray processed() const { return m_processed; }
     QString error() const { return m_error; }

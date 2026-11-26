@@ -166,3 +166,27 @@ fields. The legacy `state` and `catalogState` maps remain available unchanged.
 Volume preferences are persisted after 250 ms without further movement (and
 flushed on controller destruction), so dragging applies audio changes immediately
 without synchronously rewriting preferences at every pointer update.
+
+## Audio settings
+
+Desktop crossfade accepts 0–12 seconds and uses complementary eased output
+gains. It requires a ready next decoder and respects the current queue order.
+A prepared handoff retains each decoder's audio output, including when crossfade
+is disabled. Qt's separate decoder and device clocks can still leave a gap.
+Android uses the system media route and does not start overlapping decoders.
+
+The five-band equalizer uses the existing DSP headroom and output clamp. Its
+graph shows the response at 48 kHz, including headroom. Built-in and named
+user presets are available. SoundCloud processing requires explicit compatible
+license metadata (CC BY, CC BY-SA, or CC0). Crossfade yields to an enabled
+equalizer on those tracks to avoid combining native and processed outputs.
+The SoundCloud API does not expose a documented track loudness/peak pair for
+metadata-only normalization.
+
+The sleep timer pauses the existing playback session, including from the
+background while playback is active. Timed shutdown can lower the output gain
+over the last ten seconds. End-of-track shutdown takes precedence over natural
+repeat, crossfade and A–B repeat. A–B repeat uses the active decoder's seek
+operation, so boundary accuracy depends on its position updates and seek
+precision. Bookmarks retain only user-entered labels and positions in memory
+until the session ends or the account changes.

@@ -584,6 +584,23 @@ private slots:
         sc.m_queue = {a, b}; sc.m_queueIndex = 0; sc.resetQueueOrder(); sc.recordQueueEntry();
         sc.set("current", a); sc.player().setSource(source);
         QTRY_VERIFY(sc.player().isSeekable());
+        sc.seek(1000);
+        sc.setLoopPoint(false);
+        sc.saveMoment(-1, "Intro");
+        sc.seek(2000);
+        sc.setLoopPoint(true);
+        QCOMPARE(sc.player().position(), 1000);
+        QVERIFY(sc.loopAt(2000));
+        QCOMPARE(sc.player().position(), 1000);
+        sc.saveMoment(0, "First verse");
+        QCOMPARE(sc.state()["moments"].toList().first().toMap().value("label").toString(), QString("First verse"));
+        sc.removeMoment(0);
+        QVERIFY(sc.state()["moments"].toList().isEmpty());
+        sc.startSleepTimer(0, false);
+        QVERIFY(!sc.loopAt(2000));
+        sc.finishSleepTimer();
+        QVERIFY(!sc.state()["sleepAtEnd"].toBool());
+        QCOMPARE(sc.state()["loopEnd"].toInt(), -1);
         DesktopMedia media(&sc, nullptr); QSignalSpy updates(&media, &DesktopMedia::updated); QSignalSpy seeked(&media, &DesktopMedia::seeked);
         const QString first = media.snapshot().value("trackId").toString();
         media.command("seek", 4500, first); QTRY_COMPARE(sc.player().position(), 4500);
@@ -602,13 +619,16 @@ private slots:
         sc.m_queueIndex = 0; sc.recordQueueEntry(); sc.set("current", a);
         sc.m_preloadUrn = "soundcloud:tracks:2"; sc.m_preloadIndex = 1; sc.m_preloadPlayer->setSource(source);
         QTRY_VERIFY(sc.m_preloadPlayer->isSeekable());
-        sc.setCrossfade(true);
+        sc.setCrossfadeSeconds(7);
         sc.seek(8000);
         QTRY_COMPARE(sc.player().position(), 8000);
         QVERIFY(!sc.m_crossfadeStarted);
         QCOMPARE(sc.m_queueIndex, 0);
-        sc.beginCrossfade(); QVERIFY(sc.m_crossfadeStarted);
+        sc.beginCrossfade(1800); QVERIFY(sc.m_crossfadeStarted);
+        QCOMPARE(sc.m_crossfade.duration(), 1800);
+        auto *retainedOutput = sc.player().audioOutput();
         sc.seek(2500);
+        QCOMPARE(sc.player().audioOutput(), retainedOutput);
         QVERIFY(!sc.m_crossfadeStarted);
         QTRY_COMPARE(sc.player().position(), 2500);
         auto *incoming = sc.m_activePlayer;
@@ -928,7 +948,7 @@ private slots:
     }
     void volumeAndCrossfadePreferencesRestore() {
         QSettings preferences;
-        preferences.remove("player/volume"); preferences.remove("player/crossfade");
+        preferences.remove("player/volume"); preferences.remove("player/crossfade"); preferences.remove("player/crossfadeSeconds");
         {
             Network firstRunNet;
             SoundCloud firstRun(nullptr, &firstRunNet, secrets);
@@ -943,7 +963,7 @@ private slots:
             QVERIFY(qAbs(sc.state()["volume"].toDouble() - 0.42) < 0.001);
             QVERIFY(!sc.state()["crossfade"].toBool());
             sc.volume(0.25);
-            sc.setCrossfade(true);
+            sc.setCrossfadeSeconds(15);
             QTRY_COMPARE(preferences.value("player/volume").toDouble(), 0.25);
             QVERIFY(preferences.value("player/crossfade").toBool());
         }
@@ -951,7 +971,60 @@ private slots:
         SoundCloud restarted(nullptr, &net, secrets);
         QVERIFY(qAbs(restarted.state()["volume"].toDouble() - 0.25) < 0.001);
         QVERIFY(restarted.state()["crossfade"].toBool());
-        preferences.remove("player/volume"); preferences.remove("player/crossfade");
+        QCOMPARE(restarted.state()["crossfadeSeconds"].toInt(), 12);
+        preferences.remove("player/volume"); preferences.remove("player/crossfade"); preferences.remove("player/crossfadeSeconds");
+    }
+    void sleepTimerAndEqualizerPreset() {
+        QSettings settings;
+        settings.remove("player/equalizerPresets");
+        Network net;
+        SoundCloud sc(nullptr, &net, secrets);
+        const auto savedGains = sc.equalizerGains();
+        sc.applyEqualizerPreset(1);
+        sc.saveEqualizerPreset("Warm");
+        sc.resetEqualizer();
+        sc.applyEqualizerPreset(7);
+        QCOMPARE(sc.equalizerGains().first().toDouble(), 6.0);
+        Network restartedNet;
+        SoundCloud restarted(nullptr, &restartedNet, secrets);
+        QCOMPARE(restarted.state()["equalizerPresets"].toList().size(), 1);
+        QCOMPARE(restarted.equalizerGains(), sc.equalizerGains());
+        sc.startSleepTimer(15, true);
+        QCOMPARE(sc.state()["sleepRemaining"].toInt(), 900);
+        sc.m_sleepDuration = 5000;
+        sc.updateSleepTimer();
+        QVERIFY(sc.player().audioOutput()->volume() <= sc.volumeLevel() * 0.5 + 0.001);
+        sc.m_sleepDuration = 0;
+        sc.updateSleepTimer();
+        QCOMPARE(sc.state()["sleepRemaining"].toInt(), -1);
+        QVERIFY(!sc.m_sleepTimer.isActive());
+        QCOMPARE(sc.player().audioOutput()->volume(), float(sc.volumeLevel()));
+        for (int band = 0; band < 5; ++band)
+            sc.setEqualizerGain(band, savedGains[band].toDouble());
+        settings.remove("player/equalizerPresets");
+    }
+    void desktopAudioDevicePreference() {
+#ifndef Q_OS_ANDROID
+        QSettings settings;
+        settings.setValue("player/audioDevice", "missing-device");
+        Network net;
+        SoundCloud sc(nullptr, &net, secrets);
+        QVERIFY(sc.state()["audioDeviceUnavailable"].toBool());
+        QCOMPARE(sc.player().audioOutput()->device(), QMediaDevices::defaultAudioOutput());
+        QCOMPARE(sc.m_preloadPlayer->audioOutput()->device(), QMediaDevices::defaultAudioOutput());
+        const auto devices = sc.state()["audioDevices"].toList();
+        QVERIFY(!devices.isEmpty());
+        if (devices.size() > 1) {
+            const auto id = devices[1].toMap().value("id").toString();
+            sc.setAudioDevice(id);
+            QCOMPARE(sc.state()["audioDevice"].toString(), id);
+            QCOMPARE(sc.player().audioOutput()->device().id(), QByteArray::fromBase64(id.toLatin1()));
+        }
+        sc.setAudioDevice("");
+        QVERIFY(!sc.state()["audioDeviceUnavailable"].toBool());
+        QCOMPARE(sc.player().audioOutput()->device(), QMediaDevices::defaultAudioOutput());
+        settings.remove("player/audioDevice");
+#endif
     }
     void independentPlaybackAndCollectionNotifications() {
         Network net;
@@ -1515,7 +1588,7 @@ private slots:
             QVERIFY(!sc.state()["playbackActive"].toBool());
             QCOMPARE(sc.state()["current"], selected);
             QCOMPARE(sc.m_history, transitions);
-            QCOMPARE(sc.m_audio.volume(), float(sc.state()["volume"].toReal()));
+            QCOMPARE(sc.player().audioOutput()->volume(), float(sc.state()["volume"].toReal()));
             sc.resumePlayback();
             QCOMPARE(outgoing->playbackState(), QMediaPlayer::StoppedState);
             QVERIFY(!sc.m_crossfadeStarted);
@@ -3700,6 +3773,14 @@ private slots:
         for (int i = 0; i < 48000; ++i) isolated[i * 2 + 1] = 0;
         dsp.reset(); dsp.process(isolated.data(), 48000);
         QCOMPARE(rms(isolated, 1), 0.0);
+        dsp.configure(48000, 2, {12, 12, 12, 12, 12});
+        auto overload = tone(1000);
+        for (float &sample : overload) sample *= 10;
+        dsp.reset();
+        dsp.process(overload.data(), 48000);
+        QVERIFY(std::all_of(overload.begin(), overload.end(), [](float sample) {
+            return std::isfinite(sample) && std::abs(sample) <= 1.0f;
+        }));
         const auto bass = tone(60), treble = tone(4000), antiPhase = tone(4000, true);
         const auto bassBins = AudioDsp::spectrum(bass.data(), 2048, 2, 48000);
         const auto trebleBins = AudioDsp::spectrum(treble.data(), 2048, 2, 48000);
@@ -3767,6 +3848,9 @@ private slots:
         const bool saved = sc.equalizerEnabled(); const auto gains = sc.equalizerGains();
         sc.setEqualizerEnabled(true);
         QVERIFY(sc.equalizerEnabled());
+        QVERIFY(!sc.m_audio.isMuted());
+        sc.set("current", QVariantMap{{"urn", "soundcloud:tracks:1"}, {"license", "cc-by"}});
+        QVERIFY(sc.equalizerPermitted());
         QVERIFY(sc.m_audio.isMuted()); QVERIFY(sc.m_preloadAudio.isMuted());
         QCOMPARE(sc.m_player.audioBufferOutput(), &sc.m_waveOutput);
         sc.setEqualizerGain(0, 50); QCOMPARE(sc.equalizerGains()[0].toDouble(), 12.0);
@@ -5543,6 +5627,14 @@ private slots:
             QVERIFY(rect.left() >= 0 && rect.right() <= window->width());
             QVERIFY(!QQmlProperty(control, "Accessible.name", QQmlEngine::contextForObject(control)).read().toString().isEmpty());
         }
+        auto *audioSettings = window->findChild<QQuickItem *>("audioSettings");
+        QVERIFY(audioSettings);
+        QVERIFY(audioSettings->setProperty("expanded", true));
+        auto *responseGraph = audioSettings->findChild<QQuickItem *>("equalizerResponseGraph");
+        QTRY_VERIFY(responseGraph && responseGraph->isVisible() && responseGraph->width() > 0);
+        QVERIFY2(std::none_of(warnings.cbegin(), warnings.cend(), [](const QString &warning) {
+            return warning.contains("AudioSettings.qml");
+        }), qPrintable(warnings.join('\n')));
         net.responses = {{200, gridTracksJson(3)}};
         window->setProperty("query", "virtual-return");
         window->setProperty("section", 0);

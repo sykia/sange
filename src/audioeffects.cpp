@@ -1,5 +1,4 @@
 #include "audioeffects.h"
-#include <QMediaDevices>
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -47,6 +46,20 @@ void AudioDsp::process(float *samples, int frames)
             samples[frame * m_channels + channel] = std::clamp(value * m_headroom, -1.0, 1.0);
         }
     }
+}
+QVariantList AudioDsp::response() const
+{
+    QVariantList result;
+    for (int i = 0; i < 80; ++i) {
+        const double frequency = 30 * std::pow(18000.0 / 30, i / 79.0);
+        const auto z = std::polar(1.0, -2 * std::numbers::pi * frequency / 48000);
+        const auto z2 = z * z;
+        double gain = m_headroom;
+        for (const auto &f : m_filters)
+            gain *= std::abs((f.b0 + f.b1 * z + f.b2 * z2) / (1.0 + f.a1 * z + f.a2 * z2));
+        result.append(20 * std::log10(gain));
+    }
+    return result;
 }
 QVariantList AudioDsp::spectrum(const float *samples, int frames, int channels, int rate)
 {
@@ -105,6 +118,10 @@ void AudioEffects::setGains(const std::array<double, 5> &gains)
     m_gains = gains;
     if (m_format.isValid()) m_dsp.configure(m_format.sampleRate(), m_format.channelCount(), gains);
 }
+void AudioEffects::setVolume(double volume)
+{
+    if (m_sink) m_sink->setVolume(std::clamp(volume, 0.0, 1.0));
+}
 void AudioEffects::clear()
 {
     m_pump.stop();
@@ -126,12 +143,11 @@ QByteArray AudioEffects::floatSamples(const QAudioBuffer &buffer)
     }
     return result;
 }
-bool AudioEffects::write(const QAudioBuffer &buffer, double volume)
+bool AudioEffects::write(const QAudioBuffer &buffer, double volume, const QAudioDevice &device)
 {
     if (!buffer.isValid() || buffer.frameCount() <= 0) return true;
     QAudioFormat format = buffer.format();
     format.setSampleFormat(QAudioFormat::Float);
-    const auto device = QMediaDevices::defaultAudioOutput();
     if (!m_sink || m_format != format || m_device != device) {
         clear(); m_error.clear();
         if (device.isNull() || !device.isFormatSupported(format)) {
@@ -154,7 +170,7 @@ bool AudioEffects::write(const QAudioBuffer &buffer, double volume)
         m_error = QStringLiteral("Аудиовыход недоступен. Эквалайзер выключен.");
         clear(); return false;
     }
-    m_sink->setVolume(std::clamp(volume, 0.0, 1.0));
+    setVolume(volume);
     m_processed = floatSamples(buffer);
     m_dsp.process(reinterpret_cast<float *>(m_processed.data()), buffer.frameCount());
     m_pending.append(m_processed);

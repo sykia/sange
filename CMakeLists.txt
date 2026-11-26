@@ -41,6 +41,7 @@ set_source_files_properties(qml/DiagnosticsPanel.qml PROPERTIES QT_RESOURCE_ALIA
 set_source_files_properties(${main_qml} PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 set_source_files_properties(qml/RecommendationPreferences.qml PROPERTIES QT_RESOURCE_ALIAS RecommendationPreferences.qml)
 set_source_files_properties(qml/RecommendationNotice.qml PROPERTIES QT_RESOURCE_ALIAS RecommendationNotice.qml)
+set_source_files_properties(qml/AudioSettings.qml PROPERTIES QT_RESOURCE_ALIAS AudioSettings.qml)
 set_source_files_properties(qml/PlaybackQuality.qml PROPERTIES QT_RESOURCE_ALIAS PlaybackQuality.qml)
 set_source_files_properties(qml/CommentsPane.qml PROPERTIES QT_RESOURCE_ALIAS CommentsPane.qml)
 set_source_files_properties(qml/MetadataLabel.qml PROPERTIES QT_RESOURCE_ALIAS MetadataLabel.qml)
@@ -80,7 +81,7 @@ qt_add_qml_module(scrip
     URI SCrip
     VERSION 1.0
     RESOURCES qml/assets/blob.png
-    QML_FILES qml/SwipeDismiss.qml qml/MetadataLabel.qml qml/SheetMotion.qml qml/NetworkAccess.qml qml/DiagnosticsPanel.qml qml/CollectionTools.qml qml/RecommendationPreferences.qml qml/RecommendationNotice.qml qml/TrackInformation.qml qml/TrackProgress.qml qml/PlaybackQuality.qml qml/SelectionInput.qml qml/TrackSelection.qml qml/SelectionBar.qml qml/QueueActions.qml qml/TrackSearchFilters.qml qml/ProfileNavigation.qml qml/ProfileStat.qml qml/SurfaceButton.qml qml/EngagementAction.qml qml/PeoplePopup.qml qml/ProfileExtras.qml qml/PlaylistEditor.qml qml/CommentsPane.qml qml/SmoothWheel.qml qml/PlaylistPopup.qml qml/InteractionFeedback.qml qml/SurfaceTransition.qml ${main_qml} qml/WavePanel.qml qml/Artwork.qml qml/android/RoundedImage.qml qml/android/AndroidGlyph.qml qml/PluginAction.qml qml/PluginManagerView.qml qml/PluginPanels.qml qml/PluginToolsPopup.qml
+    QML_FILES qml/SwipeDismiss.qml qml/MetadataLabel.qml qml/SheetMotion.qml qml/NetworkAccess.qml qml/DiagnosticsPanel.qml qml/CollectionTools.qml qml/RecommendationPreferences.qml qml/RecommendationNotice.qml qml/TrackInformation.qml qml/TrackProgress.qml qml/AudioSettings.qml qml/PlaybackQuality.qml qml/SelectionInput.qml qml/TrackSelection.qml qml/SelectionBar.qml qml/QueueActions.qml qml/TrackSearchFilters.qml qml/ProfileNavigation.qml qml/ProfileStat.qml qml/SurfaceButton.qml qml/EngagementAction.qml qml/PeoplePopup.qml qml/ProfileExtras.qml qml/PlaylistEditor.qml qml/CommentsPane.qml qml/SmoothWheel.qml qml/PlaylistPopup.qml qml/InteractionFeedback.qml qml/SurfaceTransition.qml ${main_qml} qml/WavePanel.qml qml/Artwork.qml qml/android/RoundedImage.qml qml/android/AndroidGlyph.qml qml/PluginAction.qml qml/PluginManagerView.qml qml/PluginPanels.qml qml/PluginToolsPopup.qml
 )
 qt_add_shaders(scrip wave_shaders
     PREFIX "/shaders"

@@ -53,7 +53,8 @@ class SoundCloud : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantMap commentsState READ commentsState NOTIFY commentsChanged)
     Q_PROPERTY(QVariantList spectrum READ spectrum NOTIFY spectrumChanged)
-    Q_PROPERTY(QVariantList equalizerGains READ equalizerGains NOTIFY soundControlsChanged)
+    Q_PROPERTY(QVariantList equalizerGains READ equalizerGains NOTIFY equalizerGainsChanged)
+    Q_PROPERTY(QVariantList equalizerResponse READ equalizerResponse NOTIFY equalizerGainsChanged)
     Q_PROPERTY(bool equalizerEnabled READ equalizerEnabled WRITE setEqualizerEnabled NOTIFY soundControlsChanged)
     Q_PROPERTY(bool equalizerAvailable READ equalizerAvailable CONSTANT)
     Q_PROPERTY(QString equalizerError READ equalizerError NOTIFY soundControlsChanged)
@@ -85,6 +86,7 @@ public:
     QVariantMap uiState() const {
         auto state = m_state;
         for (const auto *key : {"tracks", "playlistTracks", "queue", "home"}) state.remove(key);
+        state["seekable"] = seekable();
         return state;
     }
 
@@ -131,6 +133,7 @@ public:
     double waveBeat() const { return m_waveBeat; }
     QVariantList spectrum() const { return m_spectrum; }
     QVariantList equalizerGains() const;
+    QVariantList equalizerResponse() const;
     bool equalizerEnabled() const { return m_equalizerEnabled; }
     bool equalizerAvailable() const {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
@@ -211,6 +214,18 @@ public:
     Q_INVOKABLE void setRepeatMode(int mode);
     Q_INVOKABLE void setShuffle(bool enabled);
     Q_INVOKABLE void setCrossfade(bool enabled);
+    Q_INVOKABLE void setCrossfadeSeconds(int seconds);
+    Q_INVOKABLE void setAudioDevice(const QString &id);
+    Q_INVOKABLE void startSleepTimer(int minutes, bool fade);
+    Q_INVOKABLE void cancelSleepTimer();
+    Q_INVOKABLE void setLoopPoint(bool end);
+    Q_INVOKABLE void clearLoop();
+    Q_INVOKABLE void saveMoment(int index, const QString &name);
+    Q_INVOKABLE void removeMoment(int index);
+    Q_INVOKABLE void applyEqualizerPreset(int index);
+    Q_INVOKABLE void saveEqualizerPreset(const QString &name);
+    Q_PROPERTY(bool equalizerPermitted READ equalizerPermitted NOTIFY soundControlsChanged)
+    bool equalizerPermitted() const;
     Q_INVOKABLE void setPlaybackQuality(int quality);
     Q_INVOKABLE void setPreloadEnabled(bool enabled);
     Q_INVOKABLE void setPreloadWifiOnly(bool enabled);
@@ -229,6 +244,7 @@ signals:
     void commentPosted(const QString &track);
     void spectrumChanged();
     void soundControlsChanged();
+    void equalizerGainsChanged();
     void waveAudioChanged();
     void recommendationExclusionAdded();
     void changed();
@@ -381,7 +397,12 @@ private:
     bool m_waveWaiting = false;
     void holdPreloadedAudio(QMediaPlayer *media);
     void prepareStream(const QUrl &url, int generation, int redirects = 0);
-    void beginCrossfade();
+    void beginCrossfade(int remainingMs = -1);
+    void updateAudioDevice();
+    void updateOutputVolume(double level);
+    void updateSleepTimer();
+    void finishSleepTimer();
+    bool loopAt(qint64 position);
     void finishCrossfade(bool prepare = true);
     QUrl beginLogin(bool openBrowser);
     QString m_retryToken;
@@ -427,6 +448,15 @@ private:
     QAudioOutput m_audio;
     QVariantAnimation m_volumeFade;
     QVariantAnimation m_crossfade;
+    QElapsedTimer m_sleepClock;
+    QTimer m_sleepTimer;
+    int m_crossfadeSeconds = 0;
+    qint64 m_sleepDuration = 0;
+    bool m_sleepAtEnd = false, m_sleepFade = false;
+    double m_sleepGain = 1.0;
+    qint64 m_loopStart = -1, m_loopEnd = -1;
+    QHash<QString, QVariantList> m_moments;
+    QString m_audioDeviceId, m_controlsTrack;
     QTcpServer m_callback;
     QTimer m_loginTimeout;
     QString m_configPath, m_sessionPath, m_clientId, m_clientSecret, m_redirect;

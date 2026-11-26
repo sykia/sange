@@ -704,7 +704,7 @@ ApplicationWindow {
                     Action { text: qsTr("Скачать обновление"); visible: !!app.api.updateAvailable && !app.api.updateDownloading && !app.api.updateReady && !app.api.updateInstalling; Layout.fillWidth: true; onClicked: sc.downloadUpdate() }
                     Action { text: qsTr("Отмена"); visible: !!app.api.updateDownloading; Layout.fillWidth: true; onClicked: sc.cancelUpdateDownload() }
                     Action { text: qsTr("Установить сейчас"); visible: !!app.api.updateReady && !app.api.updateInstalling; Layout.fillWidth: true; onClicked: sc.installUpdate() }
-                    Caption { text: qsTr("Воспроизведение"); font.bold: true; font.pixelSize: 19 }
+                    Caption { text: qsTr("Звук"); font.bold: true; font.pixelSize: 19 }
 
                     Action { text: qsTr("Исключения рекомендаций · ") + (app.api.recommendationExclusions || []).length; Layout.fillWidth: true; onClicked: recommendationSettings.open() }
                     Caption { text: qsTr("Качество воспроизведения"); Layout.fillWidth: true; wrapMode: Text.Wrap }
@@ -718,6 +718,11 @@ ApplicationWindow {
                     Caption { Layout.fillWidth: true; wrapMode: Text.Wrap; text: qsTr("Заранее загружать следующий трек и сегменты текущего. Качество применяется со следующей загрузки."); color: app.muted }
                     Switch { visible: !!app.api.wifiPolicyAvailable || !!app.api.preloadWifiOnly; enabled: !!app.api.preloadEnabled; objectName: "preloadWifiControl"; text: qsTr("Только по Wi-Fi"); Accessible.name: qsTr("Предзагрузка только по Wi-Fi"); checked: !!app.api.preloadWifiOnly; onToggled: sc.setPreloadWifiOnly(checked) }
                     Caption { visible: !!app.api.preloadWifiOnly; Layout.fillWidth: true; wrapMode: Text.Wrap; color: app.muted; text: qsTr("Если тип сети неизвестен, предзагрузка отключена.") }
+                    AudioSettings {
+                        Layout.fillWidth: true; Layout.minimumWidth: 0
+                        controller: sc; audio: app.api
+                        ink: app.ink; muted: app.muted; accent: app.accent
+                    }
                     Caption { text: qsTr("Оформление"); font.bold: true; font.pixelSize: 19 }
                     Switch {  text: qsTr("Тёмная тема"); checked: prefs.darkMode; onToggled: app.switchTheme(checked) }
                     Row {

@@ -2039,7 +2039,7 @@ Window {
                 }
             }
             FormBlock {
-                width: parent.width; heading: qsTr("Воспроизведение")
+                width: parent.width; heading: qsTr("Звук")
                 Flow { width: parent.width; spacing: 12; Txt { text: qsTr("Вид медиатеки"); height: 40; verticalAlignment: Text.AlignVCenter } Tool { text: qsTr("Обложки"); active: prefs.gridView; onClicked: prefs.gridView = true } Tool { text: qsTr("Список"); active: !prefs.gridView; onClicked: prefs.gridView = false } }
                 Row { spacing: 12; Txt { text: qsTr("Громкость"); anchors.verticalCenter: parent.verticalCenter } VolumeSlider { width: 180 } }
 
@@ -2053,8 +2053,11 @@ Window {
                 }
                 CheckBox { width: parent.width; objectName: "preloadControl"; Accessible.name: qsTr("Предзагрузка"); text: qsTr("Предзагрузка"); checked: !!app.api.preloadEnabled; onToggled: sc.setPreloadEnabled(checked) }
                 Txt { width: parent.width; wrapMode: Text.Wrap; text: qsTr("Заранее загружать следующий трек и сегменты текущего. Качество применяется со следующей загрузки."); color: app.muted }
-                CheckBox { InteractionFeedback {} text: qsTr("Плавный переход (3 секунды)"); enabled: !!app.api.preloadEnabled; checked: !!app.api.crossfade; onToggled: sc.setCrossfade(checked) }
-                Txt { visible: !app.api.preloadEnabled; text: qsTr("Для плавного перехода нужна предзагрузка."); width: parent.width; wrapMode: Text.Wrap; color: app.muted }
+                AudioSettings {
+                    width: parent.width
+                    controller: sc; audio: app.api
+                    ink: app.ink; muted: app.muted; accent: app.accent
+                }
             }
             FormBlock {
                 width: parent.width; heading: qsTr("Форма и движение")

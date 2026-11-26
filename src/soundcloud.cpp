@@ -256,17 +256,22 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
     connect(&m_volumeSaveTimer, &QTimer::timeout, this, [this] { QSettings().setValue("player/volume", volumeLevel()); });
     m_saveTimer.setInterval(1000);
     connect(&m_saveTimer, &QTimer::timeout, this, &SoundCloud::savePlaybackPosition);
-    player().setAudioOutput(&m_audio);
+    m_player.setAudioOutput(&m_audio);
+    m_sparePlayer.setAudioOutput(&m_preloadAudio);
+    m_preloadAudio.setVolume(0);
     auto *devices = new QMediaDevices(this);
-    const auto followOutput = [this] {
-        // Оба плеера должны следовать системному выходу, включая горячее подключение.
-        const auto output = QMediaDevices::defaultAudioOutput();
-        m_audio.setDevice(output);
-        m_preloadAudio.setDevice(output);
-    };
-    connect(devices, &QMediaDevices::audioOutputsChanged, this, followOutput);
-    followOutput();
     QSettings preferences;
+#ifndef Q_OS_ANDROID
+    m_audioDeviceId = preferences.value("player/audioDevice").toString();
+#endif
+    connect(devices, &QMediaDevices::audioOutputsChanged, this, &SoundCloud::updateAudioDevice);
+    updateAudioDevice();
+    m_sleepTimer.setTimerType(Qt::PreciseTimer);
+    m_sleepTimer.setInterval(100);
+    connect(&m_sleepTimer, &QTimer::timeout, this, &SoundCloud::updateSleepTimer);
+    set("sleepRemaining", -1);
+    set("sleepAtEnd", false);
+    clearLoop();
     set("playbackQuality", qBound(0, preferences.value("player/playbackQuality", 0).toInt(), 1));
     set("preloadEnabled", preferences.value("player/preloadEnabled", true).toBool());
     set("preloadWifiOnly", preferences.value("player/preloadWifiOnly", false).toBool());
@@ -289,6 +294,7 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
     for (int i = 0; i < 5; ++i)
         m_equalizerGains[i] = qBound(-12.0, preferences.value(QString("player/equalizer/%1").arg(i), 0).toDouble(), 12.0);
     m_playerEffects.setGains(m_equalizerGains); m_spareEffects.setGains(m_equalizerGains);
+    set("equalizerPresets", preferences.value("player/equalizerPresets").toList());
     m_equalizerEnabled = equalizerAvailable() && preferences.value("player/equalizerEnabled", false).toBool();
     m_spectrum = m_spectrumTarget = QVariantList(AudioDsp::spectrumBands, 0.0);
     updateAudioRouting();
@@ -299,18 +305,18 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
     m_androidPreload = !qEnvironmentVariableIsSet("SCRIP_ANDROID_PRELOAD") ||
         qEnvironmentVariableIntValue("SCRIP_ANDROID_PRELOAD") == 1;
 #else
-    set("crossfade", preferences.value("player/crossfade", false).toBool());
+    m_crossfadeSeconds = qBound(0, preferences.value("player/crossfadeSeconds",
+        preferences.value("player/crossfade", false).toBool() ? 3 : 0).toInt(), 12);
+    set("crossfade", m_crossfadeSeconds > 0);
 #endif
+    set("crossfadeSeconds", m_crossfadeSeconds);
     m_volumeFade.setDuration(65);
     connect(&m_volumeFade, &QVariantAnimation::valueChanged, this, [this](const QVariant &level) {
-        m_audio.setVolume(level.toFloat());
+        updateOutputVolume(level.toDouble());
     });
-    m_crossfade.setDuration(3000);
-    connect(&m_crossfade, &QVariantAnimation::valueChanged, this, [this](const QVariant &value) {
-        const qreal progress = value.toReal();
-        const qreal volume = m_state.value("volume").toReal();
-        m_audio.setVolume(volume * (1.0 - progress));
-        m_preloadAudio.setVolume(volume * progress);
+    m_crossfade.setEasingCurve(QEasingCurve::InOutSine);
+    connect(&m_crossfade, &QVariantAnimation::valueChanged, this, [this] {
+        updateOutputVolume(volumeLevel());
     });
     connect(&m_crossfade, &QVariantAnimation::finished, this, [this] { finishCrossfade(); });
     m_waveRetryTimer.setSingleShot(true);
@@ -348,8 +354,6 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
     });
 #endif
     QList<QMediaPlayer *> players{&m_player, &m_sparePlayer};
-    m_preloadAudio.setVolume(0);
-    m_preloadPlayer->setAudioOutput(&m_preloadAudio);
     for (auto *media : players) {
         connect(media, &QMediaPlayer::sourceChanged, this, [this, media] {
             (media == &m_player ? m_playerEffects : m_spareEffects).clear();
@@ -357,6 +361,9 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
         connect(media, &QMediaPlayer::playbackStateChanged, this, [this, media](QMediaPlayer::PlaybackState state) {
             if (state != QMediaPlayer::PlayingState)
                 (media == &m_player ? m_playerEffects : m_spareEffects).clear();
+        });
+        connect(media, &QMediaPlayer::sourceChanged, this, [this, media] {
+            if (media == m_activePlayer && m_controlsTrack.isEmpty()) updateAudioRouting();
         });
         connect(media, &QMediaPlayer::positionChanged, this, [this, media](qint64 p) {
             if (media != m_activePlayer) return;
@@ -369,11 +376,19 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
                 set("position", p);
                 if (!m_state.value("playbackActive").toBool()) savePlaybackPosition();
             }
+            if (m_applyingSeek || m_restoringPlayback || m_pendingSeek >= 0 ||
+                !m_state.value("playbackActive").toBool() ||
+                media->playbackState() != QMediaPlayer::PlayingState) return;
+            if (loopAt(p)) return;
             const qint64 duration = media->duration();
-            if (!m_applyingSeek && !m_restoringPlayback && m_pendingSeek < 0 && m_state.value("playbackActive").toBool()
-                && media->playbackState() == QMediaPlayer::PlayingState && m_state.value("crossfade").toBool()
-                && !m_crossfadeStarted && duration > 6000 && duration - p <= 3000)
-                beginCrossfade();
+            const qint64 remaining = duration - p;
+            if (m_sleepAtEnd && m_sleepFade && duration > 0) {
+                m_sleepGain = qBound(0.0, remaining / 10000.0, 1.0);
+                updateOutputVolume(volumeLevel());
+            }
+            const int window = int(qMin<qint64>(m_crossfadeSeconds * 1000, duration / 2));
+            if (remaining > 0 && remaining <= window && !m_crossfadeStarted)
+                beginCrossfade(int(remaining));
         });
         connect(media, &QMediaPlayer::seekableChanged, this, [this, media](bool) {
             if (media == m_activePlayer) { applyPendingSeek(); emit catalogChanged(); }
@@ -431,7 +446,8 @@ SoundCloud::SoundCloud(QObject *parent, QNetworkAccessManager *network, std::sha
             if (status == QMediaPlayer::EndOfMedia && !m_playbackRecovering && m_state.value("playbackActive").toBool()) {
                 const qint64 expected = m_state.value("current").toMap().value("duration").toLongLong();
                 if (expected > 0 && media->position() + 5000 < expected) recoverPlayback();
-                else advancePlayback(true);
+                else if (m_sleepAtEnd) finishSleepTimer();
+                else if (!loopAt(media->position())) advancePlayback(true);
             }
         });
     }
@@ -531,6 +547,8 @@ void SoundCloud::set(const QString &key, const QVariant &input) {
         }
         cancelCollectionSearch(); m_commentTrack.clear();
         m_undoQueue.clear(); set("queueUndoAvailable", false);
+        m_moments.clear();
+        set("moments", QVariantList{});
         resetSocialState();
         m_followPages.clear();
         set("followings", QVariantMap{}); set("followingPending", QVariantMap{});
@@ -583,6 +601,14 @@ void SoundCloud::set(const QString &key, const QVariant &input) {
         else m_saveTimer.stop();
     }
     if (key == "current" && !urn(m_commentTrack).isEmpty() && urn(value.toMap()) == urn(m_commentTrack)) setCommentTrack(value.toMap());
+    if (key == "current") {
+        if (urn(value.toMap()) != m_controlsTrack) {
+            m_controlsTrack = urn(value.toMap());
+            set("moments", m_moments.value(m_controlsTrack));
+        }
+        updateAudioRouting();
+        emit soundControlsChanged();
+    }
     if (key == "queue" && m_queueIds != m_undoAfterIds) set("queueUndoAvailable", false);
     if (key == "tracks") m_trackModel.update(value.toList());
     if (key == "tracks") emit collectionTracksChanged();
@@ -1658,9 +1684,52 @@ QVariantList SoundCloud::equalizerGains() const {
     for (double db : m_equalizerGains) result.append(db);
     return result;
 }
+QVariantList SoundCloud::equalizerResponse() const {
+    AudioDsp dsp;
+    dsp.configure(48000, 0, m_equalizerGains);
+    return dsp.response();
+}
+static bool permitsEqualizer(const QVariantMap &track) {
+    const auto license = track.value("license").toString();
+    return license == "cc-by" || license == "cc-by-sa" || license == "cc0";
+}
+bool SoundCloud::equalizerPermitted() const {
+    return equalizerAvailable() && (permitsEqualizer(m_state.value("current").toMap()) ||
+        (m_controlsTrack.isEmpty() && m_activePlayer->source().isLocalFile()));
+}
+void SoundCloud::applyEqualizerPreset(int index) {
+    static constexpr std::array<std::array<double, 5>, 7> presets{{
+        {0, 0, 0, 0, 0}, {6, 3, 0, 0, 0}, {0, 0, 0, 3, 6}, {-3, -1, 3, 4, 0},
+        {5, 2, -2, 2, 4}, {4, 1, -2, 3, 4}, {6, 2, -1, 1, 2}
+    }};
+    if (index >= 0 && index < int(presets.size())) {
+        for (int band = 0; band < 5; ++band) setEqualizerGain(band, presets[index][band]);
+    } else if (index >= int(presets.size())) {
+        const auto saved = QSettings().value("player/equalizerPresets").toList();
+        const auto gains = saved.value(index - int(presets.size())).toMap().value("gains").toList();
+        if (gains.size() == 5)
+            for (int band = 0; band < 5; ++band) setEqualizerGain(band, gains[band].toDouble());
+    }
+}
+void SoundCloud::saveEqualizerPreset(const QString &name) {
+    const auto label = name.trimmed().left(40);
+    if (label.isEmpty()) return;
+    QSettings settings;
+    auto presets = settings.value("player/equalizerPresets").toList();
+    const QVariantMap preset{{"label", label}, {"gains", equalizerGains()}};
+    auto existing = std::find_if(presets.begin(), presets.end(), [&label](const QVariant &entry) {
+        return entry.toMap().value("label").toString() == label;
+    });
+    if (existing != presets.end()) *existing = preset;
+    else if (presets.size() < 32) presets.append(preset);
+    else return;
+    settings.setValue("player/equalizerPresets", presets);
+    set("equalizerPresets", presets);
+}
 void SoundCloud::setEqualizerEnabled(bool enabled) {
     enabled = enabled && equalizerAvailable();
     if (m_equalizerEnabled == enabled) return;
+    if (enabled && m_crossfadeStarted) finishCrossfade();
     m_equalizerEnabled = enabled; m_equalizerError.clear();
     m_playerEffects.clear(); m_spareEffects.clear();
     QSettings().setValue("player/equalizerEnabled", enabled);
@@ -1672,7 +1741,7 @@ void SoundCloud::setEqualizerGain(int band, double db) {
     m_equalizerGains[band] = qBound(-12.0, db, 12.0);
     m_playerEffects.setGains(m_equalizerGains); m_spareEffects.setGains(m_equalizerGains);
     QSettings().setValue(QString("player/equalizer/%1").arg(band), m_equalizerGains[band]);
-    emit soundControlsChanged();
+    emit equalizerGainsChanged();
 }
 void SoundCloud::resetEqualizer() {
     for (int i = 0; i < 5; ++i) setEqualizerGain(i, 0);
@@ -1683,13 +1752,15 @@ void SoundCloud::setTrackVisualActive(bool enabled) {
     updateAudioRouting();
 }
 void SoundCloud::updateAudioRouting() {
-    const bool capture = m_waveVisualActive || m_trackVisualActive || m_equalizerEnabled;
+    const bool effects = m_equalizerEnabled && equalizerPermitted();
+    if (!effects) { m_playerEffects.clear(); m_spareEffects.clear(); }
+    const bool capture = m_waveVisualActive || m_trackVisualActive || effects;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
     m_player.setAudioBufferOutput(capture ? &m_waveOutput : nullptr);
     m_sparePlayer.setAudioBufferOutput(capture ? &m_waveSpareOutput : nullptr);
 #endif
     // Keep original outputs as playback clocks, with their existing volume/crossfade ramps.
-    m_audio.setMuted(m_equalizerEnabled); m_preloadAudio.setMuted(m_equalizerEnabled);
+    m_audio.setMuted(effects); m_preloadAudio.setMuted(effects);
     if (m_waveVisualActive || m_trackVisualActive) {
         if (!m_waveAudioTimer.isActive()) { m_waveBeatClock.start(); m_waveAudioTimer.start(); }
     } else {
@@ -1711,10 +1782,10 @@ void SoundCloud::processAudio(QMediaPlayer *media, const QAudioBuffer &buffer) {
     if (!buffer.isValid() || buffer.frameCount() <= 0 || media->playbackState() != QMediaPlayer::PlayingState) return;
     if (media != m_activePlayer && !m_crossfadeStarted) return;
     QByteArray samples;
-    if (m_equalizerEnabled) {
+    if (m_equalizerEnabled && equalizerPermitted()) {
         auto &effects = media == &m_player ? m_playerEffects : m_spareEffects;
         const double volume = media->audioOutput() ? media->audioOutput()->volume() : 0;
-        if (!effects.write(buffer, volume)) {
+        if (!effects.write(buffer, volume, m_audio.device())) {
             const auto error = effects.error();
             setEqualizerEnabled(false);
             m_equalizerError = error;
@@ -2326,15 +2397,7 @@ void SoundCloud::finishQueueEdit() {
     // Freeze the edited wave snapshot; late recommendations must not undo the edit.
     stopWave();
     m_forceNext = false;
-    if (m_crossfadeStarted) {
-        m_crossfade.stop();
-        m_preloadPlayer->stop(); m_preloadPlayer->setSource(QUrl{});
-        m_preloadPlayer->setAudioOutput(nullptr);
-        player().setAudioOutput(nullptr); player().setAudioOutput(&m_audio);
-        m_preloadPlayer->setAudioOutput(&m_preloadAudio);
-        m_audio.setVolume(m_state.value("volume").toReal()); m_preloadAudio.setVolume(0);
-        m_crossfadeStarted = false;
-    }
+    if (m_crossfadeStarted) finishCrossfade(false);
     m_state["queueIndex"] = m_queueIndex;
     set("queue", m_queue);
     savePlayback();
@@ -2481,7 +2544,9 @@ void SoundCloud::restoreQueueOrder(const QVariantMap &snapshot) {
 
 void SoundCloud::next() { advancePlayback(false); }
 void SoundCloud::advancePlayback(bool natural) {
+    if (!natural && m_sleepAtEnd) cancelSleepTimer();
     if (natural && m_waveMode.isEmpty() && m_state.value("repeatMode").toInt() == 1) {
+        if (player().isSeekable()) { seek(0); return; }
         startTrack(m_state.value("current").toMap()); return;
     }
     if (!m_waveMode.isEmpty() && m_queueIndex + 1 >= m_queue.size()) { m_waveWaiting = true; set("playbackActive", true); refillWave(); return; }
@@ -2545,6 +2610,8 @@ void SoundCloud::resumePlayback() {
     if (m_crossfadeStarted) { m_preloadPlayer->play(); m_crossfade.resume(); }
 }
 void SoundCloud::stopPlayback() {
+    cancelSleepTimer();
+    clearLoop();
     m_playbackRecoveryTimer.stop(); m_playbackRecovering = false;
     m_streamCache.suspend();
     cancelPreload();
@@ -2560,9 +2627,8 @@ void SoundCloud::stopPlayback() {
     m_streamCache.interrupt(player().source());
     player().stop(); player().setSource(QUrl{});
     m_preloadPlayer->stop(); m_preloadPlayer->setSource(QUrl{});
-    player().setAudioOutput(nullptr); m_preloadPlayer->setAudioOutput(nullptr);
-    player().setAudioOutput(&m_audio); m_preloadPlayer->setAudioOutput(&m_preloadAudio);
-    m_audio.setVolume(m_state.value("volume").toReal()); m_preloadAudio.setVolume(0);
+    m_volumeFade.stop();
+    updateOutputVolume(volumeLevel());
     m_preloadUrn.clear(); m_preloadIndex = -1;
     set("buffering", false); set("playing", false); set("current", QVariantMap{});
     set("position", 0); set("duration", 0);
@@ -2574,6 +2640,7 @@ void SoundCloud::seek(qint64 position) {
     const qint64 duration = this->duration();
     const qint64 target = duration > 0 ? qBound(qint64(0), position, duration) : qMax(qint64(0), position);
     if (m_crossfadeStarted) finishCrossfade();
+    if (m_loopEnd >= 0 && (target < m_loopStart || target >= m_loopEnd)) clearLoop();
     m_pendingSeek = target;
     set("position", target);
     applyPendingSeek();
@@ -2591,6 +2658,10 @@ void SoundCloud::applyPendingSeek() {
         const QScopedValueRollback applyingSeek(m_applyingSeek, true);
         player().setPosition(target);
     }
+    if (m_sleepAtEnd && m_sleepFade && player().duration() > 0) {
+        m_sleepGain = qBound(0.0, (player().duration() - target) / 10000.0, 1.0);
+        updateOutputVolume(volumeLevel());
+    }
     set("position", player().position());
     if (m_state.value("playbackActive").toBool()) player().play();
     savePlaybackPosition();
@@ -2599,14 +2670,15 @@ void SoundCloud::applyPendingSeek() {
 void SoundCloud::volume(double value) {
     const double target = qBound(0.0, value, 1.0);
     if (target == m_state.value("volume").toDouble()) return;
-    if (m_crossfadeStarted) {
-        const qreal progress = m_crossfade.currentValue().toReal();
-        m_audio.setVolume(target * (1.0 - progress));
-        m_preloadAudio.setVolume(target * progress);
-        set("volume", target); m_volumeSaveTimer.start(); return;
+    if (!std::isfinite(value)) return;
+    if (m_crossfadeStarted || m_sleepGain < 1.0) {
+        set("volume", target);
+        updateOutputVolume(target);
+        m_volumeSaveTimer.start();
+        return;
     }
     m_volumeFade.stop();
-    m_volumeFade.setStartValue(double(m_audio.volume()));
+    m_volumeFade.setStartValue(double(player().audioOutput()->volume()));
     m_volumeFade.setEndValue(target);
     m_volumeFade.start();
     set("volume", target);
@@ -2699,11 +2771,159 @@ bool SoundCloud::canGoPrevious() const {
         && (position() > 3000 || (!m_waveMode.isEmpty() ? m_queueIndex > 0 : m_historyCursor > 0));
 }
 
+void SoundCloud::updateAudioDevice() {
+#ifndef Q_OS_ANDROID
+    const auto outputs = QMediaDevices::audioOutputs();
+    auto selected = QMediaDevices::defaultAudioOutput();
+    QVariantList devices{QVariantMap{{"id", QString{}}, {"label", QString{}}}};
+    bool found = m_audioDeviceId.isEmpty();
+    for (const auto &device : outputs) {
+        const auto id = QString::fromLatin1(device.id().toBase64());
+        devices.append(QVariantMap{{"id", id}, {"label", device.description()}});
+        if (id == m_audioDeviceId) {
+            selected = device;
+            found = true;
+        }
+    }
+    if (m_audio.device() != selected) {
+        m_playerEffects.clear();
+        m_spareEffects.clear();
+        m_audio.setDevice(selected);
+        m_preloadAudio.setDevice(selected);
+    }
+    set("audioDevices", devices);
+    set("audioDevice", found ? m_audioDeviceId : QString{});
+    set("audioDeviceUnavailable", !found);
+#endif
+}
+void SoundCloud::setAudioDevice(const QString &id) {
+#ifndef Q_OS_ANDROID
+    const auto devices = m_state.value("audioDevices").toList();
+    if (std::none_of(devices.begin(), devices.end(), [&id](const QVariant &entry) {
+        return entry.toMap().value("id").toString() == id;
+    })) return;
+    m_audioDeviceId = id;
+    QSettings().setValue("player/audioDevice", id);
+    updateAudioDevice();
+#else
+    Q_UNUSED(id);
+#endif
+}
+void SoundCloud::updateOutputVolume(double level) {
+    const double mix = m_crossfadeStarted ? m_crossfade.currentValue().toDouble() : 1.0;
+    player().audioOutput()->setVolume(level * m_sleepGain * mix);
+    m_preloadPlayer->audioOutput()->setVolume(level * m_sleepGain * (1.0 - mix));
+    m_playerEffects.setVolume(m_player.audioOutput()->volume());
+    m_spareEffects.setVolume(m_sparePlayer.audioOutput()->volume());
+}
+void SoundCloud::startSleepTimer(int minutes, bool fade) {
+    if (minutes < 0 || minutes > 1440 ||
+        (minutes == 0 && m_state.value("current").toMap().isEmpty())) return;
+    if (minutes == 0 && m_crossfadeStarted) finishCrossfade();
+    m_volumeFade.stop();
+    m_sleepDuration = qint64(minutes) * 60000;
+    m_sleepAtEnd = minutes == 0;
+    m_sleepFade = fade;
+    m_sleepGain = 1.0;
+    m_sleepClock.start();
+    set("sleepAtEnd", m_sleepAtEnd);
+    set("sleepRemaining", minutes > 0 ? minutes * 60 : -1);
+    if (minutes > 0) m_sleepTimer.start();
+    else m_sleepTimer.stop();
+    updateOutputVolume(volumeLevel());
+}
+void SoundCloud::cancelSleepTimer() {
+    m_sleepTimer.stop();
+    m_sleepAtEnd = false;
+    m_sleepDuration = 0;
+    m_sleepGain = 1.0;
+    set("sleepRemaining", -1);
+    set("sleepAtEnd", false);
+    updateOutputVolume(volumeLevel());
+}
+void SoundCloud::updateSleepTimer() {
+    const auto remaining = m_sleepDuration - m_sleepClock.elapsed();
+    if (remaining <= 0) {
+        finishSleepTimer();
+        return;
+    }
+    set("sleepRemaining", (remaining + 999) / 1000);
+    if (m_sleepFade && remaining <= 10000) {
+        m_sleepGain = remaining / 10000.0;
+        updateOutputVolume(volumeLevel());
+    }
+}
+void SoundCloud::finishSleepTimer() {
+    const bool atEnd = m_sleepAtEnd;
+    pausePlayback();
+    cancelSleepTimer();
+    if (atEnd && player().isSeekable()) seek(0);
+}
+void SoundCloud::clearLoop() {
+    m_loopStart = m_loopEnd = -1;
+    set("loopStart", -1);
+    set("loopEnd", -1);
+}
+void SoundCloud::setLoopPoint(bool end) {
+    if (!player().isSeekable() || m_state.value("current").toMap().isEmpty()) return;
+    const auto point = player().position();
+    if (end) {
+        if (m_loopStart < 0 || point - m_loopStart < 500) return;
+        m_loopEnd = point;
+        set("loopEnd", point);
+        seek(m_loopStart);
+    } else {
+        clearLoop();
+        m_loopStart = point;
+        set("loopStart", point);
+    }
+}
+bool SoundCloud::loopAt(qint64 point) {
+    if (m_sleepAtEnd || m_loopEnd < 0 || point < m_loopEnd || !player().isSeekable()) return false;
+    seek(m_loopStart);
+    return true;
+}
+void SoundCloud::saveMoment(int index, const QString &name) {
+    if (m_controlsTrack.isEmpty() || !player().isSeekable() || name.trimmed().isEmpty()) return;
+    if (!m_moments.contains(m_controlsTrack) && m_moments.size() >= 256) return;
+    auto &moments = m_moments[m_controlsTrack];
+    const auto label = name.trimmed().left(80);
+    if (index == -1 && moments.size() < 64)
+        moments.append(QVariantMap{{"label", label}, {"position", player().position()}});
+    else if (index >= 0 && index < moments.size()) {
+        auto moment = moments[index].toMap();
+        moment["label"] = label;
+        moments[index] = moment;
+    } else return;
+    set("moments", moments);
+}
+void SoundCloud::removeMoment(int index) {
+    auto it = m_moments.find(m_controlsTrack);
+    if (it == m_moments.end() || index < 0 || index >= it->size()) return;
+    it->removeAt(index);
+    set("moments", *it);
+    if (it->isEmpty()) m_moments.erase(it);
+}
 void SoundCloud::setCrossfade(bool enabled) {
-    set("crossfade", enabled);
-    QSettings().setValue("player/crossfade", enabled);
+    setCrossfadeSeconds(enabled ? (m_crossfadeSeconds > 0 ? m_crossfadeSeconds : 3) : 0);
+}
+void SoundCloud::setCrossfadeSeconds(int seconds) {
+#ifndef Q_OS_ANDROID
+    m_crossfadeSeconds = qBound(0, seconds, 12);
+    QSettings settings;
+    settings.setValue("player/crossfadeSeconds", m_crossfadeSeconds);
+    settings.setValue("player/crossfade", m_crossfadeSeconds > 0);
+    set("crossfade", m_crossfadeSeconds > 0);
+    set("crossfadeSeconds", m_crossfadeSeconds);
+#else
+    Q_UNUSED(seconds);
+#endif
 }
 void SoundCloud::startTrack(const QVariantMap &track, bool autoplay, qint64 position, bool recovery) {
+    if (!recovery) {
+        clearLoop();
+        if (m_sleepAtEnd) cancelSleepTimer();
+    }
     recordQueueEntry();
     m_pendingSeek = -1;
     m_forceNext = false;
@@ -2722,13 +2942,8 @@ void SoundCloud::startTrack(const QVariantMap &track, bool autoplay, qint64 posi
     set("restoreCleared", false); set("playbackActive", autoplay);
     m_streamCache.suspend();
     clearError(); ++m_playGeneration; startupStage("selection");
-    if (m_crossfadeStarted) {
-        m_crossfade.stop();
-        m_preloadPlayer->stop(); m_preloadPlayer->setSource(QUrl{});
-        player().setAudioOutput(nullptr); player().setAudioOutput(&m_audio);
-        m_preloadPlayer->setAudioOutput(nullptr); m_preloadPlayer->setAudioOutput(&m_preloadAudio);
-        m_audio.setVolume(m_state.value("volume").toReal()); m_preloadAudio.setVolume(0); m_crossfadeStarted = false;
-    }
+    m_volumeFade.stop();
+    if (m_crossfadeStarted) finishCrossfade(false);
     const bool prepared = urn(track) == m_preloadUrn && !m_preloadPlayer->source().isEmpty() && m_preloadPlayer->error() == QMediaPlayer::NoError;
     if (!prepared) cancelPreload();
     m_startupUsedPreload = prepared;
@@ -2742,13 +2957,10 @@ void SoundCloud::startTrack(const QVariantMap &track, bool autoplay, qint64 posi
     player().stop(); player().setSource(QUrl{});
     if (prepared) {
         startupStage("preloaded_source");
-        player().setAudioOutput(nullptr);
-        m_preloadPlayer->setAudioOutput(nullptr);
         std::swap(m_activePlayer, m_preloadPlayer);
         m_startupSourceSet = true;
-        player().setAudioOutput(&m_audio);
-        m_preloadPlayer->setAudioOutput(&m_preloadAudio);
     }
+    updateOutputVolume(volumeLevel());
     m_preloadUrn.clear(); m_preloadIndex = -1;
     set("current", track); set("position", position); set("duration", track.value("duration")); set("buffering", true);
     savePlayback();
@@ -3280,21 +3492,27 @@ void SoundCloud::prepareNext(bool reset) {
 }
 void SoundCloud::finishCrossfade(bool prepare) {
     m_crossfade.stop();
-    m_preloadPlayer->stop(); m_preloadPlayer->setSource(QUrl{}); m_preloadPlayer->setAudioOutput(nullptr);
-    player().setAudioOutput(nullptr); player().setAudioOutput(&m_audio);
-    m_preloadPlayer->setAudioOutput(&m_preloadAudio);
-    m_audio.setVolume(m_state.value("volume").toReal()); m_preloadAudio.setVolume(0);
+    m_preloadPlayer->stop();
+    m_preloadPlayer->setSource(QUrl{});
     m_crossfadeStarted = false;
+    updateOutputVolume(volumeLevel());
     if (prepare) prepareNext();
 }
-void SoundCloud::beginCrossfade() {
-    if (!preloadAllowed()) return;
+void SoundCloud::beginCrossfade(int remainingMs) {
+#ifdef Q_OS_ANDROID
+    return;
+#endif
+    if (!preloadAllowed() || m_sleepAtEnd || m_loopEnd >= 0 ||
+        (remainingMs >= 0 && !m_crossfadeSeconds)) return;
     if ((m_waveMode.isEmpty() && m_state.value("repeatMode").toInt() == 1) ||
         m_preloadIndex != nextQueueIndex(true) || m_crossfadeStarted || m_queue.isEmpty() || m_preloadIndex < 0 || m_preloadIndex >= m_queue.size() ||
         m_preloadPlayer->source().isEmpty() || m_preloadPlayer->error() != QMediaPlayer::NoError ||
         (m_preloadPlayer->mediaStatus() != QMediaPlayer::BufferedMedia && m_preloadPlayer->mediaStatus() != QMediaPlayer::LoadedMedia) ||
         urn(m_queue[m_preloadIndex].toMap()) != m_preloadUrn) return;
     const QVariantMap nextTrack = m_queue[m_preloadIndex].toMap();
+    if (m_equalizerEnabled && (equalizerPermitted() || permitsEqualizer(nextTrack))) return;
+    clearLoop();
+    m_volumeFade.stop();
     m_followHistory = !m_forceNext && m_historyCursor + 1 < m_history.size()
         && m_queueIds.value(m_preloadIndex) == m_history.value(m_historyCursor + 1);
     if (m_followHistory) ++m_historyCursor;
@@ -3311,10 +3529,15 @@ void SoundCloud::beginCrossfade() {
     std::swap(m_activePlayer, m_preloadPlayer);
     m_preloadUrn.clear(); m_preloadIndex = -1;
     m_crossfadeStarted = true;
+    m_crossfade.setDuration(remainingMs > 0 ? remainingMs : qMax(1, m_crossfadeSeconds) * 1000);
+    m_crossfade.setStartValue(0.0);
+    m_crossfade.setEndValue(1.0);
+    m_crossfade.setCurrentTime(0);
+    updateOutputVolume(volumeLevel());
     m_streamCache.suspend();
     incoming->play();
     m_streamCache.warm(incoming->source());
-    m_crossfade.stop(); m_crossfade.setStartValue(0.0); m_crossfade.setEndValue(1.0); m_crossfade.start();
+    m_crossfade.start();
     savePlayback();
 }
 void SoundCloud::prepareStream(const QUrl &url, int generation, int redirects) {
