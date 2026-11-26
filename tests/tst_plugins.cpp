@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QMouseEvent>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -1406,6 +1407,8 @@ Item {
         QVERIFY(window->grabWindow().save("android-playlist-landscape.png"));
         QQmlExpression dismissPreview(QQmlEngine::contextForObject(object.data()), object.data(), "playlistView.close()");
         dismissPreview.evaluate();
+        QVERIFY(!dismissPreview.hasError());
+        QTRY_VERIFY(!previewPopup->property("visible").toBool());
         window->resize(412, 860);
         QTest::qWait(300);
 
@@ -1413,9 +1416,17 @@ Item {
         auto *mini = qobject_cast<QQuickItem *>(miniExpression.evaluate().value<QObject *>());
         QVERIFY(mini);
         QQmlExpression playerVisible(QQmlEngine::contextForObject(object.data()), object.data(), "player.visible");
+        // Deliver moves with the pressed button set. Window-system cursor motion
+        // can lose the simulated button state on an offscreen macOS runner.
+        const auto dragMouse = [window](const QPoint &point, int delay) {
+            QMouseEvent move(QEvent::MouseMove, point, point, window->mapToGlobal(point),
+                             Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(window, &move);
+            QTest::qWait(delay);
+        };
         const QPoint start = mini->mapToScene(QPointF(100, mini->height() / 2)).toPoint();
         QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
-        for (int y = 10; y <= 300; y += 10) QTest::mouseMove(window, start - QPoint(0, y), 10);
+        for (int y = 10; y <= 300; y += 10) dragMouse(start - QPoint(0, y), 10);
         QTest::qWait(150);
         QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, start - QPoint(0, 300));
         QTRY_VERIFY_WITH_TIMEOUT(playerVisible.evaluate().toBool(), 1500);
@@ -1471,14 +1482,14 @@ Item {
         window->resize(412, 860); QTest::qWait(100);
         const QPoint playerStart(200, 100);
         QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, playerStart);
-        for (int y = 10; y <= 50; y += 10) QTest::mouseMove(window, playerStart + QPoint(0, y), 5);
+        for (int y = 10; y <= 50; y += 10) dragMouse(playerStart + QPoint(0, y), 5);
         QTest::qWait(150); // A held short pull must return, without stale inertia.
         QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, playerStart + QPoint(0, 50));
         QQmlExpression dragOffset(QQmlEngine::contextForObject(object.data()), object.data(), "player.dragOffset");
         QTRY_COMPARE(dragOffset.evaluate().toReal(), 0.0);
         QVERIFY(playerVisible.evaluate().toBool());
         QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, playerStart);
-        for (int y = 10; y <= 130; y += 10) QTest::mouseMove(window, playerStart + QPoint(0, y), 5);
+        for (int y = 10; y <= 130; y += 10) dragMouse(playerStart + QPoint(0, y), 5);
         QTest::qWait(150); // Deliberately release slowly: distance alone closes the sheet.
         QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, playerStart + QPoint(0, 130));
         QTRY_VERIFY_WITH_TIMEOUT(!playerVisible.evaluate().toBool(), 1500);
