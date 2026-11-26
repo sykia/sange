@@ -129,6 +129,7 @@ public:
     QList<QNetworkRequest> requests;
     QList<QByteArray> bodies;
     QList<QByteArray> methods;
+    QPointer<Reply> lastReply;
     QSet<QString> responseHosts;
     QHash<QString, QList<Response>> hostResponses;
     bool routeByHost = false;
@@ -142,7 +143,8 @@ protected:
         if (routeByHost) r = hostResponses[host].isEmpty() ? Response{404, "{}"} : hostResponses[host].takeFirst();
         else if (!responseHosts.isEmpty() && !responseHosts.contains(host)) r = {404, "{}"};
         else r = responses.isEmpty() ? Response{500, "{}"} : responses.takeFirst();
-        return new Reply(request, r, this);
+        lastReply = new Reply(request, r, this);
+        return lastReply;
     }
 };
 #endif
@@ -2167,20 +2169,29 @@ private slots:
         Network net; net.responses = {guest()}; SoundCloud sc(nullptr, &net, secrets);
         QTRY_VERIFY(sc.state()["connected"].toBool()); sc.set("signedIn", true);
         sc.set("profile", QVariantMap{{"urn", "soundcloud:users:1"}});
-        net.responses = {{200, "{}", 40}, {200, "{}", 180}, {500, "{}"}};
+        Response save{200, "{}"};
+        save.held = true;
+        net.responses = {save, save, {500, "{}"}};
         QSignalSpy saved(&sc, &SoundCloud::trackSaved);
         sc.saveToPlaylist("soundcloud:tracks:1", "", "Old account");
+        const auto oldSave = net.lastReply;
+        QVERIFY(oldSave);
+        QSignalSpy oldFinished(oldSave, &QNetworkReply::finished);
         sc.set("profile", QVariantMap{{"urn", "soundcloud:users:2"}});
         sc.saveToPlaylist("soundcloud:tracks:2", "", "New account");
+        const auto newSave = net.lastReply;
+        QVERIFY(newSave && newSave != oldSave);
         sc.editPlaylist({{"urn", "soundcloud:playlists:2"}});
         QTRY_VERIFY(!sc.state()["playlistEditBusy"].toBool());
         QVERIFY(!sc.state()["playlistEditError"].toString().isEmpty());
-        QTest::qWait(60);
+        oldSave->release();
+        QTRY_COMPARE(oldFinished.size(), 1);
         QCOMPARE(saved.size(), 0);
         QVERIFY(sc.state()["savingTrack"].toBool());
         const auto requests = net.requests.size();
         sc.saveToPlaylist("soundcloud:tracks:3", "", "Parallel");
         QCOMPARE(net.requests.size(), requests);
+        newSave->release();
         QTRY_COMPARE(saved.size(), 1);
         QVERIFY(!sc.state()["savingTrack"].toBool());
     }
@@ -2656,9 +2667,8 @@ private slots:
             SoundCloud sc(nullptr, &net, secrets);
             sc.set("configured", false); sc.m_access = "test-access"; sc.m_expires = QDateTime::currentSecsSinceEpoch() + 3600;
             sc.set("buffering", true); sc.browse("tracks", "loading");
-            const auto pending = net.findChildren<QNetworkReply *>();
-            QCOMPARE(pending.size(), 1);
-            auto *listingReply = static_cast<Reply *>(pending.first());
+            const auto listingReply = net.lastReply;
+            QVERIFY(listingReply);
             sc.profile();
             QTRY_VERIFY(!sc.state()["error"].toString().isEmpty());
             QVERIFY(sc.state()["busy"].toBool());
@@ -2700,10 +2710,16 @@ private slots:
         Network net; SoundCloud sc(nullptr, &net, secrets); sc.set("configured", false);
         QCoreApplication::processEvents();
         sc.set("configured", true);
-        net.responses = {{401, "{}"}, {401, "{}", 150}, guest(), {200, "{}"}, {200, "{}"}};
+        Response stale{401, "{}"};
+        stale.held = true;
+        net.responses = {{401, "{}"}, stale, guest(), {200, "{}"}, {200, "{}"}};
         int completed = 0;
         sc.request("/early", [&completed](QJsonDocument) { ++completed; });
         sc.request("/late", [&completed](QJsonDocument) { ++completed; });
+        const auto staleReply = net.lastReply;
+        QVERIFY(staleReply);
+        QTRY_COMPARE(completed, 1);
+        staleReply->release();
         QTRY_COMPARE(completed, 2);
         QCOMPARE(net.requests.size(), 5);
         QCOMPARE(net.requests[2].url().path(), QString("/oauth/token"));
