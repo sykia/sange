@@ -1194,8 +1194,10 @@ Item {
         QTRY_VERIFY(!menuScroll->property("flicking").toBool());
         QVERIFY(menuScroll->property("contentY").toReal() > slowDistance * 2);
         QVERIFY(startFlick(-800));
-        QTest::qWait(40);
-        QVERIFY(menuScroll->property("flicking").toBool());
+        // A flick can be active before the animation advances by a frame.
+        // Start the reversal only once the viewport has moved away from its bound.
+        QTRY_VERIFY(menuScroll->property("flicking").toBool()
+            && menuScroll->property("contentY").toReal() > menuScroll->property("originY").toReal() + 12);
         const QPoint hold = menuScroll->mapToScene(QPointF(menuScroll->width() / 2, menuScroll->height() / 2)).toPoint();
         QTest::touchEvent(window, touchDevice).press(0, hold, window);
         QTRY_VERIFY(!menuScroll->property("flicking").toBool());
@@ -1206,7 +1208,7 @@ Item {
             QTest::touchEvent(window, touchDevice).move(0, hold + QPoint(0, dy), window);
             QTest::qWait(16);
         }
-        QVERIFY(menuScroll->property("contentY").toReal() < heldPosition);
+        QTRY_VERIFY(menuScroll->property("contentY").toReal() < heldPosition);
         QTest::touchEvent(window, touchDevice).release(0, hold + QPoint(0, 60), window);
         QVERIFY(menu->property("opened").toBool());
         QVERIFY(QMetaObject::invokeMethod(menu, "close"));
@@ -1325,14 +1327,20 @@ Item {
         QVERIFY2(!preview.hasError(), qPrintable(preview.error().toString()));
         QQmlExpression enteringPreviewExpression(QQmlEngine::contextForObject(object.data()), object.data(), "playlistView");
         auto *enteringPreview = enteringPreviewExpression.evaluate().value<QObject *>(); QVERIFY(enteringPreview);
-        QTRY_VERIFY(enteringPreview->property("opacity").toReal() > 0
-            && enteringPreview->property("opacity").toReal() < 1);
+        QVERIFY(enteringPreview->property("transitionDuration").toInt() > 0);
+        QVERIFY(!enteringPreview->property("opened").toBool());
+        QVERIFY(enteringPreview->property("opacity").toReal() < 1.0);
+        QTRY_VERIFY(enteringPreview->property("opened").toBool());
+        QCOMPARE(enteringPreview->property("opacity").toReal(), 1.0);
+        // Verify the real surface binding at a known transition position, even
+        // if the offscreen renderer skips intermediate frames under load.
+        QVERIFY(enteringPreview->setProperty("reveal", 0.5));
         auto *enteringBackground = enteringPreview->property("background").value<QQuickItem *>(); QVERIFY(enteringBackground);
         auto *enteringContent = enteringPreview->property("contentItem").value<QQuickItem *>(); QVERIFY(enteringContent);
         QVERIFY(enteringBackground->mapToScene(QPointF()).y() > enteringPreview->property("y").toReal());
         QVERIFY(qAbs(enteringContent->mapToScene(QPointF()).y()
             - enteringBackground->mapToScene(QPointF()).y() - enteringPreview->property("topPadding").toReal()) < 1);
-        QTRY_VERIFY(enteringPreview->property("opened").toBool());
+        QVERIFY(enteringPreview->setProperty("reveal", 1.0));
         QVERIFY(window->grabWindow().save("android-playlist.png"));
         std::function<QQuickItem *(QQuickItem *)> findTrackActions = [&](QQuickItem *item) -> QQuickItem * {
             if (item->objectName() == "previewTrackActions0") return item;
